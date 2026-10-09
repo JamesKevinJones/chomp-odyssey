@@ -136,6 +136,27 @@ const store = {
 const LEVELS = [
   {
     name: 'THE NEON CLASSIC', hint: 'CLEAR EVERY PELLET · USE THE SIDE TUNNELS',
+    // Stage briefing shown before the stage starts. '# ' marks a heading, {N} becomes the pellet count.
+    brief: [
+      '# YOUR GOAL',
+      'Eat all {N} pellets to clear the maze.',
+      '# THE RULES',
+      '- A ghost touching you costs a life. You have 3, and',
+      '  earn an extra life every 10,000 points.',
+      '- Eat one of the 4 big power pellets and the ghosts turn',
+      '  blue for 6 seconds. Blue ghosts can be eaten:',
+      '  200, 400, 800, then 1600 points in a row.',
+      '- Blue ghosts that flash white are about to recover.',
+      '  Eaten ghosts float home as eyes, then come back.',
+      '- Fruit appears below the ghost house twice: 100 points.',
+      '- The side tunnels wrap around. Ghosts slow down inside.',
+      '# KNOW YOUR GHOSTS',
+      '- They take turns scattering to their corners and',
+      '  hunting you. Blinky (red) chases you directly and',
+      '  speeds up near the end. Pinky (pink) aims ahead of',
+      '  you. Inky (cyan) flanks. Clyde (orange) backs off',
+      '  whenever he gets close.',
+    ],
     wall: '#2f6bff', fill: '#050d33', dot: '#ffcf9e',
     doorY: 12, start: [13.5, 23], msgY: 17,
     fruit: { x: 13.5, y: 17, kind: 0, points: 100 },
@@ -176,6 +197,19 @@ const LEVELS = [
   },
   {
     name: 'THE CYBER CITADEL', hint: 'CYAN STRIPS = +20% SPEED · FOUR WARP TUNNELS',
+    brief: [
+      '# YOUR GOAL',
+      'Eat all {N} pellets to clear the city grid.',
+      '# WHAT\'S NEW',
+      '- Cyan speed strips run down the middle. You move 20%',
+      '  faster on them; the ghosts don\'t.',
+      '- Four warp tunnels instead of two, on both sides.',
+      '- The grid is wide open: more ways to escape, but the',
+      '  ghosts can come at you from more directions too.',
+      '# HARDER',
+      '- Ghosts are faster, and power pellets last 5 seconds.',
+      '- The fruit is a strawberry worth 300.',
+    ],
     wall: '#ff2bd6', fill: '#1d0424', dot: '#9ff8ff',
     doorY: 11, start: [13.5, 22], msgY: 16,
     fruit: { x: 13.5, y: 16, kind: 1, points: 300 },
@@ -216,6 +250,23 @@ const LEVELS = [
   },
   {
     name: 'THE LABYRINTH OF SHADOWS', hint: 'ONE-WAY GATES · TELEPORT PADS · STAY IN THE LIGHT',
+    brief: [
+      '# YOUR GOAL',
+      'Eat all {N} pellets, in the dark.',
+      '# WHAT\'S NEW',
+      '- Darkness: you only see what your lantern lights up.',
+      '  Ghosts vanish in the dark, but their eyes still glint.',
+      '  A power pellet makes your lantern shine wider.',
+      '- Green arrows are one-way gates. You and the ghosts',
+      '  can only pass through in the arrow\'s direction.',
+      '- Rings are teleporters. Step on one and you come out',
+      '  of the other ring of the same colour, still moving.',
+      '  Ghosts can\'t use them, so they\'re a great escape.',
+      '- There are no side tunnels on this stage.',
+      '# HARDER',
+      '- Ghosts are faster still; power pellets last 4 seconds.',
+      '- The fruit is an orange worth 500.',
+    ],
     wall: '#8a3cff', fill: '#10041f', dot: '#b9ffcf', dark: true,
     doorY: 12, start: [13.5, 23], msgY: 17,
     fruit: { x: 13.5, y: 17, kind: 2, points: 500 },
@@ -256,6 +307,26 @@ const LEVELS = [
   },
   {
     name: 'THE CORE', hint: 'EAT A MEGA-ENERGIZER, THEN RAM THE KING', boss: true,
+    brief: [
+      '# YOUR GOAL',
+      'Drain the Glitch King\'s 9-point health bar to zero.',
+      '# TWO WAYS TO HURT HIM',
+      '- Rainbow mega-energizers sit in the 4 corners. Eat one',
+      '  to charge up for 8 seconds, then ram the king: 1 hit.',
+      '  A ram uses up the charge. Each one returns in 10 s.',
+      '- Eat every pellet in the arena and the 4 gold nodes',
+      '  light up. Step on one for lightning: 2 hits. The',
+      '  pellets then come back for another round.',
+      '# HIS ATTACKS',
+      '- Phase 1: spawns green minions and charges across',
+      '  the chamber. A red lane flashes before each charge.',
+      '- Phase 2 (6 HP): fires energy balls, and the X floor',
+      '  tiles flash yellow, then spark. Sparks kill.',
+      '- Phase 3 (3 HP): faster, triple shots, and a stomp.',
+      '  Leave the red ring or you\'re slowed for 3 seconds.',
+      '- Touching him kills you unless you\'re charged. While',
+      '  you\'re charged, minions turn blue: eat them for 300.',
+    ],
     wall: '#ff3b30', fill: '#260404', dot: '#ffd0a0',
     doorY: null, start: [13.5, 29], msgY: 15,
     chamber: { x0: 7.5, x1: 19.5, y0: 8.5, y1: 21.5 }, // open floor the boss is confined to (tile edges)
@@ -1456,6 +1527,7 @@ class UIManager {
   drawOverlay(ctx, t) {
     const g = this.game, L = g.level, rowY = r => HUD_TOP + r * TS + 8, my = rowY(L.msgY);
     switch (g.state) {
+      case 'briefing': this.drawBriefing(ctx, t); break;
       case 'ready':
         drawLabel(ctx, `STAGE ${g.levelIndex + 1} · ${L.name}`, VIEW_W / 2, HUD_TOP + 22, { size: 11, color: '#2af6ff' });
         drawLabel(ctx, 'READY!', VIEW_W / 2, my, { size: 16, color: '#ffe600', glow: 10 });
@@ -1493,7 +1565,7 @@ class UIManager {
       }
     }
     if (g.bannerMsg) {
-      const y = HUD_TOP + 22;
+      const y = g.state === 'briefing' ? VIEW_H - 64 : HUD_TOP + 22;
       ctx.fillStyle = 'rgba(0,0,0,.78)'; ctx.fillRect(0, y - 12, VIEW_W, 24);
       drawText(ctx, g.bannerMsg.text, VIEW_W / 2, y, { size: 12, color: '#ffd400', glow: 8 });
     }
@@ -1506,6 +1578,30 @@ class UIManager {
       drawText(ctx, 'SPACE / P TO RESUME', VIEW_W / 2, VIEW_H / 2 + 20, { size: 11 });
     }
     if (g.guide) this.drawGuide(ctx);
+  }
+  // Stage briefing: the rules and win condition, shown before every stage until the player continues.
+  drawBriefing(ctx, t) {
+    const g = this.game, L = g.level, mid = VIEW_W / 2;
+    ctx.fillStyle = 'rgba(0,0,8,.97)'; ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+    if (g.fromClear) drawText(ctx, `STAGE ${g.levelIndex} CLEARED!   SCORE ${g.score}`, mid, 26, { size: 12, color: '#ffe600', glow: 8 });
+    let y = 56;
+    drawText(ctx, `STAGE ${g.levelIndex + 1} OF ${LEVELS.length}${L.boss ? ' · FINAL BATTLE' : ''}`, mid, y, { size: 10, color: '#7f9bb5' });
+    y += 22;
+    drawText(ctx, L.name, mid, y, { size: 20, color: L.wall, glow: 12 });
+    y += 34;
+    for (const s of L.brief) {
+      const text = s.replace('{N}', g.map.total);
+      if (s.startsWith('# ')) {
+        y += 6;
+        drawText(ctx, text.slice(2), 22, y, { size: 12, color: '#ffe600', align: 'left', glow: 6 });
+        y += 17;
+      } else {
+        drawText(ctx, text, 30, y, { size: 10, color: '#d8f6ff', align: 'left' });
+        y += 14;
+      }
+    }
+    drawText(ctx, 'TO WIN THE GAME: CLEAR STAGES 1-3, THEN DEFEAT THE GLITCH KING', mid, VIEW_H - 40, { size: 9, color: '#2af6ff' });
+    if (g.stateTimer <= 0 && Math.floor(t * 2) % 2 === 0) drawText(ctx, 'PRESS ENTER OR TAP TO START THE STAGE', mid, VIEW_H - 20, { size: 11, glow: 6 });
   }
   // How-to-play screen (H / GUIDE button). Secrets appear here only once they have been found.
   drawGuide(ctx) {
@@ -1610,7 +1706,7 @@ class GameEngine {
   get minions() { return this.ents.minions; }
   get boss() { return this.ents.boss; }
   get balls() { return this.ents.balls; }
-  get inGame() { return ['ready', 'play', 'dying', 'clear', 'bossintro'].includes(this.state); }
+  get inGame() { return ['briefing', 'ready', 'play', 'dying', 'clear', 'bossintro'].includes(this.state); }
 
   start() {
     let last = performance.now(), acc = 0;
@@ -1634,6 +1730,10 @@ class GameEngine {
     if (kind === 'warp') { this.warp(arg); return; }
     if (kind === 'skip') { this.skipStage(); return; }
     if (kind === 'freeze') { if (this.inGame) this.toggleFreeze(); return; }
+    if (this.state === 'briefing') {
+      if (kind !== 'pause' && this.stateTimer <= 0) this.beginStage();
+      return;
+    }
     if (this.state === 'title') { if (kind !== 'pause') this.newGame(); return; }
     if (this.state === 'gameover' || this.state === 'victory') {
       if (kind !== 'pause' && this.stateTimer <= 0) { this.state = 'title'; this.fx.clear(); }
@@ -1670,7 +1770,7 @@ class GameEngine {
     if (!this.discover('warp')) this.banner(`WARP · STAGE ${i + 1}`, 1.6);
   }
   skipStage() {
-    if (!['ready', 'play', 'bossintro'].includes(this.state)) return;
+    if (!['briefing', 'ready', 'play', 'bossintro'].includes(this.state)) return;
     this.paused = false; this.state = 'play'; this.ui.syncButtons();
     if (this.level.boss) { // a skipped boss pays no points, so cheats can't inflate the high score
       const score = this.score, hi = this.hi;
@@ -1698,8 +1798,8 @@ class GameEngine {
     this.paused = false; this.timeStop = false; this.fx.clear();
     this.loadLevel(start);
   }
-  loadLevel(i) {
-    this.levelIndex = i; this.level = LEVELS[i];
+  loadLevel(i, fromClear = false) {
+    this.levelIndex = i; this.level = LEVELS[i]; this.fromClear = fromClear; // briefing opens with "stage cleared"
     this.map.load(this.level);
     this.ents.setup(this.level);
     this.ui.buildMaze();
@@ -1713,8 +1813,13 @@ class GameEngine {
     this.frightTimer = 0; this.roundTime = 0; this.freeze = 0; this.freezeGhost = null; this.combo = 0;
     if (this.hazard) this.hazard = { phase: 'off', t: 3 };
     this.audio.setLoop(null);
-    if (fresh && this.level.boss) { this.state = 'bossintro'; this.stateTimer = 3.4; this.audio.bossRoar(); }
-    else { this.state = 'ready'; this.stateTimer = fresh ? 2.4 : 1.6; if (fresh) this.audio.fanfare(); }
+    if (fresh) { this.state = 'briefing'; this.stateTimer = 0.6; } // stateTimer: input guard so a double-tap can't skip it
+    else { this.state = 'ready'; this.stateTimer = 1.6; }
+  }
+  // Leaves the stage briefing (Enter / Space / tap).
+  beginStage() {
+    if (this.level.boss) { this.state = 'bossintro'; this.stateTimer = 3.4; this.audio.bossRoar(); }
+    else { this.state = 'ready'; this.stateTimer = 2.4; this.audio.fanfare(); }
   }
   banner(text, t) { this.bannerMsg = { text, t }; }
   addScore(n) {
@@ -1733,6 +1838,7 @@ class GameEngine {
     if (this.bannerMsg && (this.bannerMsg.t -= dt) <= 0) this.bannerMsg = null;
     this.shake = this.shake > 0.2 ? this.shake * Math.exp(-dt * 7) : 0;
     switch (this.state) {
+      case 'briefing': this.stateTimer -= dt; break;
       case 'bossintro':
         if ((this.stateTimer -= dt) <= 0) { this.state = 'ready'; this.stateTimer = 2; this.audio.fanfare(); }
         break;
@@ -1743,7 +1849,7 @@ class GameEngine {
       case 'dying': this.updateDying(dt); break;
       case 'clear':
         if ((this.stateTimer -= dt) <= 0) {
-          if (this.levelIndex + 1 < LEVELS.length) this.loadLevel(this.levelIndex + 1); else this.victory();
+          if (this.levelIndex + 1 < LEVELS.length) this.loadLevel(this.levelIndex + 1, true); else this.victory();
         }
         break;
       case 'gameover': this.stateTimer -= dt; break;

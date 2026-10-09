@@ -24,7 +24,9 @@ synthesized with the Web Audio API.
   the arena so the four gold nodes light up, then step on one (2 hits).
 - You start with 3 lives and earn another every 10,000 points.
 
-Press **H** (or the GUIDE button) at any time for the in-game guide.
+Every stage opens with a briefing that explains its rules, what's new, and what
+it takes to clear it. Press **H** (or the GUIDE button) at any time for the full
+in-game guide.
 
 ## Controls
 
