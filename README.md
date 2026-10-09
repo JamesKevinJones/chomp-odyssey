@@ -5,7 +5,7 @@ their classic personalities, and a three-phase boss fight. No images, no audio
 files, no libraries: every sprite is drawn on a canvas and every sound is
 synthesized with the Web Audio API.
 
-**Play:** PLAY_URL
+**Play:** https://chomp-odyssey.vercel.app
 
 ## Stages
 
