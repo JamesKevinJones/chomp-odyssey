@@ -1,0 +1,1788 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<title>Chomp Odyssey</title>
+<style>
+  :root { --ink: #d8f6ff; --dim: #5d7a90; --accent: #ffe600; --panel: rgba(12, 18, 40, .8); --edge: #2a3a66; }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; background: #000; color: var(--ink); overflow: hidden;
+    font-family: "Courier New", Courier, monospace; -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #app { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 8px 16px; }
+  #stage { position: relative; flex: none; box-shadow: 0 0 48px rgba(60, 110, 255, .16); }
+  #game { display: block; width: 100%; height: 100%; image-rendering: pixelated; touch-action: none; cursor: pointer; }
+
+  /* CRT overlay: scanlines + vignette, toggled with the CRT button or C */
+  #crt {
+    position: absolute; inset: 0; pointer-events: none; display: none;
+    background:
+      repeating-linear-gradient(to bottom, transparent 0 2px, rgba(0, 0, 0, .3) 2px 3px, transparent 3px 4px),
+      radial-gradient(ellipse at center, transparent 58%, rgba(0, 0, 0, .6) 100%);
+    animation: flicker 5s infinite steps(1);
+  }
+  #stage.crt-on #crt { display: block; }
+  @keyframes flicker { 0%, 100% { opacity: 1 } 46% { opacity: .9 } 47% { opacity: 1 } 81% { opacity: .94 } }
+  @media (prefers-reduced-motion: reduce) { #crt { animation: none; } }
+
+  #controls { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; flex: none; }
+  #controls button {
+    font: inherit; font-weight: 700; font-size: 12px; letter-spacing: .08em; color: var(--ink);
+    background: var(--panel); border: 1px solid var(--edge); border-radius: 6px; padding: 8px 12px; min-height: 36px; cursor: pointer;
+  }
+  #controls button:hover { border-color: #5677ff; }
+  #controls button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  #controls button[aria-pressed="false"] { color: var(--dim); }
+
+  /* Virtual D-pad (translucent). Below the game in portrait, floating bottom-right on short landscape screens. */
+  #dpad { position: relative; flex: none; width: 156px; height: 156px; display: none; opacity: .75; }
+  body.dpad-on #dpad { display: block; }
+  @media (orientation: landscape) and (max-height: 640px) { #dpad { position: fixed; right: 16px; bottom: 16px; opacity: .5; } }
+  #dpad button {
+    position: absolute; width: 52px; height: 52px; padding: 0; border-radius: 12px; touch-action: none;
+    border: 2px solid rgba(255, 255, 255, .45); background: rgba(40, 70, 170, .35); color: #fff; font-size: 20px;
+  }
+  #dpad button:active { background: rgba(255, 230, 0, .45); }
+  #dpad [data-dir="up"] { left: 52px; top: 0; }
+  #dpad [data-dir="left"] { left: 0; top: 52px; }
+  #dpad [data-dir="right"] { left: 104px; top: 52px; }
+  #dpad [data-dir="down"] { left: 52px; top: 104px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="stage">
+    <canvas id="game" role="img" aria-label="Chomp Odyssey game screen"></canvas>
+    <div id="crt"></div>
+  </div>
+  <div id="dpad" aria-label="Virtual direction pad">
+    <button data-dir="up" aria-label="Up">&#9650;</button>
+    <button data-dir="left" aria-label="Left">&#9664;</button>
+    <button data-dir="right" aria-label="Right">&#9654;</button>
+    <button data-dir="down" aria-label="Down">&#9660;</button>
+  </div>
+  <div id="controls">
+    <button id="btn-sound" type="button">SOUND: ON</button>
+    <button id="btn-crt" type="button">CRT: ON</button>
+    <button id="btn-pause" type="button">PAUSE</button>
+    <button id="btn-dpad" type="button">D-PAD: OFF</button>
+  </div>
+</div>
+
+<script>
+'use strict';
+/* ==========================================================================
+   CHOMP ODYSSEY
+   A single-file arcade maze game. Everything is procedural: graphics are
+   drawn on a 2D canvas, sound is synthesized with the Web Audio API.
+
+   Modules (top to bottom):
+     Constants & helpers  - grid size, directions, storage
+     LEVELS               - 4 hand-built 28x31 mazes + per-stage tuning
+     AudioManager         - chiptune SFX and background loops
+     InputManager         - keyboard, swipe, virtual D-pad
+     MapManager           - tile grid, collision, tunnels, eyes pathfinding
+     Entities             - Mover base, Player, Ghost, Minion, Boss
+     EntityManager        - owns and updates every actor
+     FX                   - particles, rings, lightning, score popups
+     UIManager            - canvas rendering, HUD, overlays, DOM buttons
+     GameEngine           - state machine + fixed-timestep loop
+   ========================================================================== */
+
+// ---------------------------------------------------------------- constants
+const TS = 16;                       // logical pixels per tile
+const COLS = 28, ROWS = 31;
+const HUD_TOP = 56, HUD_BOTTOM = 32;
+const VIEW_W = COLS * TS;            // 448
+const VIEW_H = HUD_TOP + ROWS * TS + HUD_BOTTOM; // 584
+const STEP = 1 / 60;                 // fixed simulation step (seconds)
+const BASE_SPEED = 9.47;             // tiles/second at "100%" arcade speed
+const EXTRA_LIFE_SCORE = 10000;
+const MODE_SCHEDULE = [7, 20, 7, 20, 5, 20, 5, Infinity]; // scatter, chase, scatter, ...
+const BOSS_COLORS = ['', '#b44bff', '#ff7a1a', '#ff2244'];
+
+const UP = { x: 0, y: -1, a: -Math.PI / 2 }, DOWN = { x: 0, y: 1, a: Math.PI / 2 };
+const LEFT = { x: -1, y: 0, a: Math.PI }, RIGHT = { x: 1, y: 0, a: 0 }, NONE = { x: 0, y: 0, a: 0 };
+UP.opp = DOWN; DOWN.opp = UP; LEFT.opp = RIGHT; RIGHT.opp = LEFT; NONE.opp = NONE;
+const DIR_ORDER = [UP, LEFT, DOWN, RIGHT]; // arcade tie-break order for ghost decisions
+const ONEWAY = { '^': UP, 'v': DOWN, '<': LEFT, '>': RIGHT };
+
+const wrapX = x => ((x % COLS) + COLS) % COLS;
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const dist2 = (ax, ay, bx, by) => (ax - bx) ** 2 + (ay - by) ** 2;
+const rand = (a, b) => a + Math.random() * (b - a);
+const pick = arr => arr[(Math.random() * arr.length) | 0];
+const $ = sel => document.querySelector(sel);
+
+// localStorage can throw (private mode, blocked storage) - the game must still run.
+const store = {
+  get(k, d) { try { const v = localStorage.getItem('chompOdyssey.' + k); return v === null ? d : v; } catch { return d; } },
+  set(k, v) { try { localStorage.setItem('chompOdyssey.' + k, String(v)); } catch { /* storage unavailable */ } },
+};
+
+/* ---------------------------------------------------------------- LEVELS
+   Tile legend:
+     #  wall              -  ghost-house door     .  pellet (10)
+     o  power pellet (50) =  speed strip + pellet <>^v  one-way gate
+     1 2 teleporter pads  x  hazard (electrified) M  mega-energizer
+     N  power node        (space) empty floor
+   Every map was machine-checked: 28x31, all pellets reachable, every tile can
+   return to the start through the one-way graph, no dead ends.            */
+const LEVELS = [
+  {
+    name: 'THE NEON CLASSIC', hint: 'CLEAR EVERY PELLET · USE THE SIDE TUNNELS',
+    wall: '#2f6bff', fill: '#050d33', dot: '#ffcf9e',
+    doorY: 12, start: [13.5, 23], msgY: 17,
+    fruit: { x: 13.5, y: 17, kind: 0, points: 100 },
+    speed: { player: 0.80, ghost: 0.75, fright: 0.50, tunnel: 0.40 }, frightTime: 6, release: [0, 0.5, 4, 8],
+    map: [
+      '############################',
+      '#............##............#',
+      '#.####.#####.##.#####.####.#',
+      '#o####.#####.##.#####.####o#',
+      '#.####.#####.##.#####.####.#',
+      '#..........................#',
+      '#.####.##.########.##.####.#',
+      '#.####.##.########.##.####.#',
+      '#......##....##....##......#',
+      '######.##### ## #####.######',
+      '######.##### ## #####.######',
+      '######.##          ##.######',
+      '######.## ###--### ##.######',
+      '######.## #      # ##.######',
+      '      .   #      #   .      ',
+      '######.## #      # ##.######',
+      '######.## ######## ##.######',
+      '######.##          ##.######',
+      '######.## ######## ##.######',
+      '######.## ######## ##.######',
+      '#............##............#',
+      '#.####.#####.##.#####.####.#',
+      '#.####.#####.##.#####.####.#',
+      '#o..##.......  .......##..o#',
+      '###.##.##.########.##.##.###',
+      '###.##.##.########.##.##.###',
+      '#......##....##....##......#',
+      '#.##########.##.##########.#',
+      '#.##########.##.##########.#',
+      '#..........................#',
+      '############################',
+    ],
+  },
+  {
+    name: 'THE CYBER CITADEL', hint: 'CYAN STRIPS = +20% SPEED · FOUR WARP TUNNELS',
+    wall: '#ff2bd6', fill: '#1d0424', dot: '#9ff8ff',
+    doorY: 11, start: [13.5, 22], msgY: 16,
+    fruit: { x: 13.5, y: 16, kind: 1, points: 300 },
+    speed: { player: 0.85, ghost: 0.82, fright: 0.52, tunnel: 0.45 }, frightTime: 5, release: [0, 0.5, 3, 6],
+    map: [
+      '############################',
+      '#............==............#',
+      '#.#####.##.##==##.##.#####.#',
+      '#.#####.##.##==##.##.#####.#',
+      ' ............==............ ',
+      '#.##.##.#####==#####.##.##.#',
+      '#.##.##.#####==#####.##.##.#',
+      '#o...........==...........o#',
+      '#.##.#####.##==##.#####.##.#',
+      '#.##.#####.##==##.#####.##.#',
+      ' .......................... ',
+      '#.##.##.#####--#####.##.##.#',
+      '#.##.##.###      ###.##.##.#',
+      '#.......###      ###.......#',
+      '#.##.##.###      ###.##.##.#',
+      '#.##.##.############.##.##.#',
+      ' .......................... ',
+      '#.##.##.##.##==##.##.##.##.#',
+      '#.##.##.##.##==##.##.##.##.#',
+      '#o...........==...........o#',
+      '#.##.#####.##==##.#####.##.#',
+      '#.##.#####.##==##.#####.##.#',
+      ' ............==............ ',
+      '#.##.##.#####==#####.##.##.#',
+      '#.##.##.#####==#####.##.##.#',
+      '#............==............#',
+      '#.#####.##.##==##.##.#####.#',
+      '#.#####.##.##==##.##.#####.#',
+      '#............==............#',
+      '############################',
+      '############################',
+    ],
+  },
+  {
+    name: 'THE LABYRINTH OF SHADOWS', hint: 'ONE-WAY GATES · TELEPORT PADS · STAY IN THE LIGHT',
+    wall: '#8a3cff', fill: '#10041f', dot: '#b9ffcf', dark: true,
+    doorY: 12, start: [13.5, 23], msgY: 17,
+    fruit: { x: 13.5, y: 17, kind: 2, points: 500 },
+    speed: { player: 0.88, ghost: 0.86, fright: 0.55, tunnel: 0.48 }, frightTime: 4, release: [0, 0.5, 2.5, 5],
+    map: [
+      '############################',
+      '#o.........#..............o#',
+      '#.#####.##.#.###.#########.#',
+      '#.#####.##.#.###.#########.#',
+      '#..................>.......#',
+      '#.###.#.##.#########.#####.#',
+      '#.###.#.##.#########.#####.#',
+      '#.###.#.##.#########.#####.#',
+      '#.....1.##...........#..2..#',
+      '#.###.################..##.#',
+      '#.###.################..##.#',
+      '#.###....          .....##.#',
+      '#.####### ###--### ####.##.#',
+      '#v####### #      # ####.##.#',
+      '#........ #      # ........#',
+      '#.####### #      # #####.#^#',
+      '#.####### ######## #####.#.#',
+      '#.#......          ......#.#',
+      '#.#.###########.####.#####.#',
+      '#.#.###########.####.#####.#',
+      '#.............#............#',
+      '#.#.#######.#.######.#####.#',
+      '#.#.#######.#.######.#####.#',
+      '#........<.................#',
+      '#.######.##.#####.##.#####.#',
+      '#.######.##.#####.##.#####.#',
+      '#...2....##.....>....1.....#',
+      '#.####.##########.########.#',
+      '#.####.##########.########.#',
+      '#o........................o#',
+      '############################',
+    ],
+  },
+  {
+    name: 'THE CORE', hint: 'EAT A MEGA-ENERGIZER, THEN RAM THE KING', boss: true,
+    wall: '#ff3b30', fill: '#260404', dot: '#ffd0a0',
+    doorY: null, start: [13.5, 29], msgY: 15,
+    chamber: { x0: 7.5, x1: 19.5, y0: 8.5, y1: 21.5 }, // open floor the boss is confined to (tile edges)
+    speed: { player: 0.88, minion: 0.68, fright: 0.45 },
+    map: [
+      '############################',
+      '#M........................M#',
+      '#.######.##########.######.#',
+      '#.######.##########.######.#',
+      '#.######.##########.######.#',
+      '#.###N...xxxx..xxxx...N###.#',
+      '#.###.#######..#######.###.#',
+      '#.###.#######..#######.###.#',
+      '#.###.#######..#######.###.#',
+      '#.....##            ##.....#',
+      '#.###x##            ##x###.#',
+      '#.###x##            ##x###.#',
+      '#.###x##            ##x###.#',
+      '#.###x##            ##x###.#',
+      '#.###x##            ##x###.#',
+      '#.###...            ...###.#',
+      '#.###x##            ##x###.#',
+      '#.###x##            ##x###.#',
+      '#.###x##            ##x###.#',
+      '#.###x##            ##x###.#',
+      '#.###x##            ##x###.#',
+      '#.....##            ##.....#',
+      '#.###.#######..#######.###.#',
+      '#.###.#######..#######.###.#',
+      '#.###.#######..#######.###.#',
+      '#.###N...xxxx..xxxx...N###.#',
+      '#.######.##########.######.#',
+      '#.######.##########.######.#',
+      '#.######.##########.######.#',
+      '#M........................M#',
+      '############################',
+    ],
+  },
+];
+
+const GHOSTS = [
+  { name: 'BLINKY', role: 'THE CHASER',   color: '#ff2a2a', scatter: [COLS - 3, -3],  home: 13.5 },
+  { name: 'PINKY',  role: 'THE AMBUSHER', color: '#ff9ae6', scatter: [2, -3],         home: 13.5 },
+  { name: 'INKY',   role: 'THE FLANKER',  color: '#2af6ff', scatter: [COLS - 1, ROWS + 1], home: 11.5 },
+  { name: 'CLYDE',  role: 'THE COWARD',   color: '#ffad33', scatter: [0, ROWS + 1],   home: 15.5 },
+];
+
+/* ============================================================ AudioManager
+   All sounds are oscillators + gain envelopes (+ a shared noise buffer).
+   One background loop at a time: 'siren' | 'fright' | 'boss' | null.     */
+class AudioManager {
+  constructor() {
+    this.ctx = null;
+    this.muted = store.get('muted', '0') === '1';
+    this.loop = null; this.loopKind = null;
+    this.waka = false; this.lastChomp = 0;
+  }
+  init() { // must run inside a user gesture
+    if (!this.ctx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      this.ctx = new AC();
+      this.master = this.ctx.createGain();
+      this.master.gain.value = this.muted ? 0 : 0.6;
+      this.master.connect(this.ctx.destination);
+      const len = this.ctx.sampleRate;
+      this.noiseBuf = this.ctx.createBuffer(1, len, len);
+      const d = this.noiseBuf.getChannelData(0);
+      for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+    }
+    if (this.ctx.state === 'suspended') this.ctx.resume();
+  }
+  toggleMute() {
+    this.muted = !this.muted;
+    store.set('muted', this.muted ? 1 : 0);
+    if (this.master) this.master.gain.setTargetAtTime(this.muted ? 0 : 0.6, this.ctx.currentTime, 0.02);
+    return this.muted;
+  }
+  tone(f, dur, { type = 'square', vol = 0.15, to = 0, at = 0, attack = 0.005 } = {}) {
+    if (!this.ctx) return;
+    const t = this.ctx.currentTime + at, o = this.ctx.createOscillator(), g = this.ctx.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(f, t);
+    if (to) o.frequency.exponentialRampToValueAtTime(to, t + dur);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + attack);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(this.master);
+    o.start(t); o.stop(t + dur + 0.05);
+  }
+  noise(dur, { vol = 0.2, at = 0, freq = 1000, q = 1, filter = 'bandpass' } = {}) {
+    if (!this.ctx) return;
+    const t = this.ctx.currentTime + at, s = this.ctx.createBufferSource();
+    const f = this.ctx.createBiquadFilter(), g = this.ctx.createGain();
+    s.buffer = this.noiseBuf; f.type = filter; f.frequency.value = freq; f.Q.value = q;
+    g.gain.setValueAtTime(vol, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    s.connect(f); f.connect(g); g.connect(this.master);
+    s.start(t, Math.random() * 0.5); s.stop(t + dur + 0.05);
+  }
+  // Waka-waka: alternating triangle sweeps 220<->440 Hz
+  chomp() {
+    const now = performance.now();
+    if (now - this.lastChomp < 70) return;
+    this.lastChomp = now;
+    this.waka = !this.waka;
+    this.tone(this.waka ? 220 : 440, 0.09, { type: 'triangle', to: this.waka ? 440 : 220, vol: 0.22 });
+  }
+  // Power pellet: low square wave whose amplitude is pulsed by an LFO
+  powerPellet() {
+    if (!this.ctx) return;
+    const c = this.ctx, t = c.currentTime;
+    const o = c.createOscillator(), g = c.createGain(), env = c.createGain();
+    const lfo = c.createOscillator(), lg = c.createGain();
+    o.type = 'square'; o.frequency.value = 65;
+    lfo.frequency.value = 14; lg.gain.value = 0.12; g.gain.value = 0.12;
+    env.gain.setValueAtTime(1, t); env.gain.exponentialRampToValueAtTime(0.001, t + 0.6);
+    lfo.connect(lg); lg.connect(g.gain); o.connect(g); g.connect(env); env.connect(this.master);
+    o.start(t); lfo.start(t); o.stop(t + 0.65); lfo.stop(t + 0.65);
+  }
+  ghostEaten() { [1046, 784, 622, 466, 349].forEach((f, i) => this.tone(f, 0.06, { at: i * 0.045, vol: 0.14 })); }
+  fruit() { this.tone(660, 0.08, { vol: 0.12 }); this.tone(990, 0.12, { at: 0.07, vol: 0.12 }); }
+  extraLife() { [523, 659, 784, 1046, 1318].forEach((f, i) => this.tone(f, 0.1, { at: i * 0.08, vol: 0.12, type: 'triangle' })); }
+  // Death: descending chromatic sweep with noise bursts
+  death() {
+    for (let i = 0; i < 16; i++) {
+      const f = 988 * Math.pow(2, -i / 12);
+      this.tone(f, 0.09, { at: i * 0.08, to: f * 0.92, vol: 0.13 });
+    }
+    [0, 0.42, 0.84, 1.28].forEach(at => this.noise(0.12, { at, vol: 0.18, freq: 1800, q: 0.8 }));
+    this.tone(196, 0.12, { at: 1.4, vol: 0.15 }); this.tone(130, 0.2, { at: 1.55, vol: 0.15 });
+  }
+  bossRoar() {
+    this.tone(110, 1.1, { type: 'sawtooth', to: 38, vol: 0.25, attack: 0.05 });
+    this.tone(82, 1.0, { type: 'square', to: 30, vol: 0.14, attack: 0.05 });
+    this.noise(0.9, { vol: 0.25, freq: 320, filter: 'lowpass' });
+  }
+  bossHit() { this.tone(200, 0.35, { to: 45, vol: 0.25 }); this.noise(0.25, { vol: 0.3, freq: 800, q: 0.7 }); }
+  // Level start: 4-note ascending arpeggio with a triangle bass an octave down
+  fanfare() {
+    [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => {
+      const d = i === 3 ? 0.45 : 0.16;
+      this.tone(f, d, { at: i * 0.16, vol: 0.14 });
+      this.tone(f / 2, d, { at: i * 0.16, type: 'triangle', vol: 0.12 });
+    });
+  }
+  zap() { this.noise(0.3, { vol: 0.16, freq: 3500, q: 3 }); this.tone(1400, 0.2, { type: 'sawtooth', to: 300, vol: 0.05 }); }
+  shoot() { this.tone(700, 0.14, { to: 180, vol: 0.08 }); }
+  stomp() { this.tone(70, 0.6, { type: 'sine', to: 28, vol: 0.35 }); this.noise(0.5, { vol: 0.35, freq: 220, filter: 'lowpass' }); }
+  teleport() { this.tone(300, 0.22, { type: 'sine', to: 1600, vol: 0.14 }); }
+  warn() { this.tone(880, 0.12, { vol: 0.1 }); this.tone(660, 0.12, { at: 0.14, vol: 0.1 }); }
+  nodeBlast() { this.noise(0.6, { vol: 0.3, freq: 2000, q: 0.5 }); this.tone(1200, 0.5, { type: 'sawtooth', to: 80, vol: 0.15 }); }
+
+  setLoop(kind, intensity = 0) {
+    if (!this.ctx) return;
+    if (kind !== this.loopKind) {
+      if (this.loop) {
+        const t = this.ctx.currentTime;
+        this.loop.out.gain.setTargetAtTime(0, t, 0.03);
+        this.loop.nodes.forEach(n => n.stop(t + 0.2));
+      }
+      this.loop = kind ? this.buildLoop(kind) : null;
+      this.loopKind = kind;
+    }
+    if (this.loop && this.loop.set) this.loop.set(intensity);
+  }
+  buildLoop(kind) {
+    const c = this.ctx, t = c.currentTime, out = c.createGain(), nodes = [];
+    out.gain.value = 0; out.connect(this.master);
+    const osc = (type, f) => { const o = c.createOscillator(); o.type = type; o.frequency.value = f; o.start(t); nodes.push(o); return o; };
+    const lfo = (param, rate, depth, type = 'sine') => { const l = osc(type, rate), g = c.createGain(); g.gain.value = depth; l.connect(g); g.connect(param); return l; };
+    const gain = v => { const g = c.createGain(); g.gain.value = v; return g; };
+    let set = null;
+    if (kind === 'siren') { // subtle pitch slide that speeds up as the maze empties
+      const o = osc('triangle', 360), rate = lfo(o.frequency, 2.2, 90), g = gain(0.045);
+      o.connect(g); g.connect(out);
+      set = k => { o.frequency.setTargetAtTime(360 + k * 260, c.currentTime, 0.3); rate.frequency.setTargetAtTime(2.2 + k * 3, c.currentTime, 0.3); };
+    } else if (kind === 'fright') { // eerie high trill + low pulsing hum
+      const o = osc('sine', 1180), g = gain(0.03);
+      lfo(o.frequency, 15, 180, 'square'); o.connect(g); g.connect(out);
+      const h = osc('square', 58), hg = gain(0.025);
+      lfo(hg.gain, 7, 0.025); h.connect(hg); hg.connect(out);
+    } else if (kind === 'boss') { // ominous filtered drone
+      const o = osc('sawtooth', 55), f = c.createBiquadFilter(), g = gain(0.07);
+      f.type = 'lowpass'; f.frequency.value = 380;
+      lfo(o.frequency, 0.5, 6); lfo(g.gain, 2, 0.04);
+      o.connect(f); f.connect(g); g.connect(out);
+      const p = osc('triangle', 220), pg = gain(0.022);
+      lfo(p.frequency, 3, 30); p.connect(pg); pg.connect(out);
+      set = k => o.frequency.setTargetAtTime(55 + k * 30, c.currentTime, 0.5);
+    }
+    out.gain.setTargetAtTime(1, t, 0.05);
+    return { out, nodes, set };
+  }
+}
+
+/* ============================================================ InputManager
+   `dir` is a buffered desired direction: it stays set until replaced, so a
+   turn pressed early is taken the moment the corridor opens.              */
+class InputManager {
+  constructor(game, canvas) {
+    this.dir = NONE;
+    const KEYS = { ArrowUp: UP, KeyW: UP, ArrowDown: DOWN, KeyS: DOWN, ArrowLeft: LEFT, KeyA: LEFT, ArrowRight: RIGHT, KeyD: RIGHT };
+    addEventListener('keydown', e => {
+      const d = KEYS[e.code];
+      if (d) { this.dir = d; e.preventDefault(); return; }
+      if (e.repeat) return;
+      switch (e.code) {
+        case 'Space': e.preventDefault(); game.action('primary'); break;
+        case 'Enter': case 'NumpadEnter': e.preventDefault(); game.action('start'); break;
+        case 'KeyP': case 'Escape': game.action('pause'); break;
+        case 'KeyM': game.action('mute'); break;
+        case 'KeyC': game.action('crt'); break;
+      }
+    });
+    // Swipes: each 22px of drag commits a direction, so one long drag can steer through several turns.
+    let sx = 0, sy = 0, down = false;
+    canvas.addEventListener('pointerdown', e => { down = true; sx = e.clientX; sy = e.clientY; game.action('tap'); });
+    canvas.addEventListener('pointermove', e => {
+      if (!down) return;
+      const dx = e.clientX - sx, dy = e.clientY - sy;
+      if (dx * dx + dy * dy < 22 * 22) return;
+      this.dir = Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? RIGHT : LEFT) : (dy > 0 ? DOWN : UP);
+      sx = e.clientX; sy = e.clientY;
+    });
+    const up = () => { down = false; };
+    canvas.addEventListener('pointerup', up);
+    canvas.addEventListener('pointercancel', up);
+    const PAD = { up: UP, down: DOWN, left: LEFT, right: RIGHT };
+    document.querySelectorAll('#dpad button').forEach(b => b.addEventListener('pointerdown', e => {
+      e.preventDefault();
+      this.dir = PAD[b.dataset.dir];
+      game.action('tap');
+    }));
+  }
+}
+
+/* ============================================================== MapManager */
+class MapManager {
+  load(level) {
+    this.level = level;
+    this.grid = level.map.map(r => r.split(''));
+    this.dots = new Uint8Array(COLS * ROWS); // 0 none, 1 pellet, 2 power, 3 mega
+    this.total = 0; this.eaten = 0; this.armed = false;
+    this.teleports = {}; this.megas = []; this.specials = [];
+    for (let y = 0; y < ROWS; y++) for (let x = 0; x < COLS; x++) {
+      const c = this.grid[y][x], i = y * COLS + x;
+      if (c === '.' || c === '=') { this.dots[i] = 1; this.total++; }
+      else if (c === 'o') { this.dots[i] = 2; this.total++; }
+      else if (c === 'M') { this.dots[i] = 3; this.megas.push({ x, y, timer: 0 }); }
+      if (c === '1' || c === '2') (this.teleports[c] = this.teleports[c] || []).push({ x, y });
+      if ('=<>^v12xN'.includes(c)) this.specials.push({ x, y, c });
+    }
+    this.left = this.total;
+    this.origDots = this.dots.slice();
+    this.tunnel = this.findTunnels();
+    this.eyes = level.doorY == null ? null : this.buildEyesMap(level.doorY - 1);
+  }
+  idx(x, y) { return y * COLS + wrapX(x); }
+  tile(x, y) { return y < 0 || y >= ROWS ? '#' : this.grid[y][wrapX(x)]; }
+  solid(x, y) { const c = this.tile(x, y); return c === '#' || c === '-'; }
+  // Can an actor standing on (x,y) step one tile in direction d? Respects one-way gates on both tiles.
+  passable(x, y, d) {
+    if (d === NONE) return false;
+    const nx = x + d.x, ny = y + d.y;
+    if (this.solid(nx, ny)) return false;
+    const a = ONEWAY[this.tile(x, y)], b = ONEWAY[this.tile(nx, ny)];
+    return (!a || a === d) && (!b || b === d);
+  }
+  // A tunnel is the straight open run from a screen edge up to the first junction.
+  findTunnels() {
+    const t = new Uint8Array(COLS * ROWS);
+    for (let y = 0; y < ROWS; y++) {
+      if (this.solid(0, y) || this.solid(COLS - 1, y)) continue;
+      for (const [start, step] of [[0, 1], [COLS - 1, -1]]) {
+        for (let x = start; x >= 0 && x < COLS; x += step) {
+          if (this.solid(x, y) || !this.solid(x, y - 1) || !this.solid(x, y + 1)) break;
+          t[y * COLS + x] = 1;
+        }
+      }
+    }
+    return t;
+  }
+  // BFS over reversed edges: distance from every tile to the tile above the ghost-house door.
+  buildEyesMap(ey) {
+    const d = new Int16Array(COLS * ROWS).fill(-1), q = [];
+    for (const x of [13, 14]) { d[ey * COLS + x] = 0; q.push([x, ey]); }
+    for (let h = 0; h < q.length; h++) {
+      const [x, y] = q[h];
+      for (const dir of DIR_ORDER) {
+        const ux = wrapX(x - dir.x), uy = y - dir.y;
+        if (uy < 0 || uy >= ROWS) continue;
+        const ui = uy * COLS + ux;
+        if (d[ui] < 0 && this.passable(ux, uy, dir)) { d[ui] = d[y * COLS + x] + 1; q.push([ux, uy]); }
+      }
+    }
+    return d;
+  }
+  refillPellets() {
+    for (let i = 0; i < this.dots.length; i++) if (this.origDots[i] === 1 || this.origDots[i] === 2) this.dots[i] = this.origDots[i];
+    this.left = this.total;
+  }
+}
+
+/* ================================================================ Entities
+   Grid movers live "between" two tile centres: standing on (tx,ty), heading
+   `dir`, `p` (0..1) of the way to the next tile. Decisions happen on arrival
+   at a centre. ox/oy is a purely visual offset that smooths corner snaps.  */
+class Mover {
+  constructor() { this.tx = 0; this.ty = 0; this.p = 0; this.dir = LEFT; this.ox = 0; this.oy = 0; this.free = false; this.fx = 0; this.fy = 0; }
+  place(x, y, dir) { // x may be a half tile (e.g. 13.5) when heading horizontally
+    this.free = false; this.dir = dir; this.ty = Math.round(y); this.ox = this.oy = 0;
+    const frac = x - Math.floor(x);
+    if (frac > 0.01 && dir.x !== 0) {
+      if (dir.x < 0) { this.tx = Math.ceil(x); this.p = this.tx - x; } else { this.tx = Math.floor(x); this.p = x - this.tx; }
+    } else { this.tx = Math.round(x); this.p = 0; }
+  }
+  get rx() { return this.tx + this.dir.x * this.p; }
+  get ry() { return this.ty + this.dir.y * this.p; }
+  get x() { return this.free ? this.fx : this.rx + this.ox; }
+  get y() { return this.free ? this.fy : this.ry + this.oy; }
+  canReverse(map) {
+    if (this.dir === NONE) return false;
+    if (this.p === 0) return map.passable(this.tx, this.ty, this.dir.opp);
+    return map.passable(wrapX(this.tx + this.dir.x), this.ty + this.dir.y, this.dir.opp);
+  }
+  reverse(map) {
+    if (!this.canReverse(map)) return false;
+    if (this.p > 0) { this.tx = wrapX(this.tx + this.dir.x); this.ty += this.dir.y; this.p = 1 - this.p; }
+    this.dir = this.dir.opp;
+    return true;
+  }
+  advance(map, dist) {
+    for (let guard = 0; dist > 1e-9 && guard < 6; guard++) {
+      if (this.dir === NONE) return;
+      if (this.p === 0 && !map.passable(this.tx, this.ty, this.dir)) {
+        this.blocked(map);
+        if (this.dir === NONE || !map.passable(this.tx, this.ty, this.dir)) return;
+      }
+      const rem = 1 - this.p;
+      if (dist < rem) { this.p += dist; dist = 0; }
+      else { dist -= rem; this.tx = wrapX(this.tx + this.dir.x); this.ty += this.dir.y; this.p = 0; this.arrive(map); }
+    }
+  }
+  decayOffset(dt) { const k = Math.exp(-dt * 22); this.ox *= k; this.oy *= k; }
+  blocked() {}
+  arrive() {}
+}
+
+class Player extends Mover {
+  constructor(game) { super(); this.game = game; }
+  reset(level) {
+    this.place(level.start[0], level.start[1], LEFT);
+    this.facing = LEFT; this.chomp = 0; this.power = 0; this.slow = 0;
+  }
+  speed() {
+    const g = this.game;
+    let s = BASE_SPEED * g.level.speed.player;
+    if (g.map.tile(this.tx, this.ty) === '=') s *= 1.2;
+    if (this.slow > 0) s *= 0.5;
+    if (this.power > 0 || g.frightTimer > 0) s *= 1.08;
+    return s;
+  }
+  update(dt) {
+    const map = this.game.map, want = this.game.input.dir;
+    this.power = Math.max(0, this.power - dt);
+    this.slow = Math.max(0, this.slow - dt);
+    if (want !== NONE && want !== this.dir) {
+      if (this.dir === NONE) { if (map.passable(this.tx, this.ty, want)) this.dir = want; }
+      else if (want === this.dir.opp) this.reverse(map);
+      else this.tryCorner(map, want);
+    }
+    const d = this.speed() * dt;
+    this.advance(map, d);
+    if (this.dir !== NONE) { this.facing = this.dir; this.chomp += d; }
+    this.decayOffset(dt);
+  }
+  // Forgiving cornering: a perpendicular turn is accepted up to ~5px either side of a junction.
+  tryCorner(map, want) {
+    const ox = this.rx, oy = this.ry;
+    if (this.p < 0.35 && map.passable(this.tx, this.ty, want)) { this.p = 0; this.dir = want; }
+    else if (this.p > 0.65) {
+      const nx = wrapX(this.tx + this.dir.x), ny = this.ty + this.dir.y, c = map.tile(nx, ny);
+      if (c === '1' || c === '2' || !map.passable(nx, ny, want)) return;
+      this.tx = nx; this.ty = ny; this.p = 0; this.arrive(map);
+    } else return;
+    let dx = ox - this.rx, dy = oy - this.ry;
+    if (Math.abs(dx) > 1 || Math.abs(dy) > 1) dx = dy = 0;
+    this.ox += dx; this.oy += dy;
+  }
+  arrive(map) {
+    const g = this.game;
+    g.eatAt(this.tx, this.ty);
+    const c = map.tile(this.tx, this.ty);
+    if (c === '1' || c === '2') {
+      const dest = map.teleports[c].find(p => p.x !== this.tx || p.y !== this.ty);
+      if (dest) {
+        g.fx.ring(this.tx, this.ty, c === '1' ? '#38f9ff' : '#ff9f1a');
+        this.tx = dest.x; this.ty = dest.y; this.ox = this.oy = 0;
+        g.fx.ring(dest.x, dest.y, c === '1' ? '#38f9ff' : '#ff9f1a', 2.2);
+        g.audio.teleport();
+        g.eatAt(dest.x, dest.y);
+      }
+    }
+    if (c === 'N') g.onNode();
+    const want = g.input.dir;
+    if (want !== NONE && map.passable(this.tx, this.ty, want)) this.dir = want;
+    else if (!map.passable(this.tx, this.ty, this.dir)) this.dir = NONE;
+  }
+  blocked() { this.dir = NONE; }
+}
+
+class Ghost extends Mover {
+  constructor(game, cfg, i) { super(); Object.assign(this, cfg); this.game = game; this.i = i; }
+  reset() {
+    const L = this.game.level;
+    this.fright = false; this.releaseAt = L.release[this.i]; this.bob = this.i * 1.7;
+    if (this.i === 0) { this.state = 'active'; this.place(13.5, L.doorY - 1, LEFT); }
+    else { this.state = 'house'; this.free = true; this.fx = this.home; this.fy = L.doorY + 2; }
+  }
+  get lookDir() {
+    if (!this.free) return this.dir;
+    if (this.state === 'leaving') return UP;
+    if (this.state === 'entering') return DOWN;
+    return Math.sin(this.bob) > 0 ? DOWN : UP;
+  }
+  speed() {
+    const g = this.game, S = g.level.speed;
+    if (this.state === 'eaten') return BASE_SPEED * 1.6;
+    if (g.map.tunnel[g.map.idx(this.tx, this.ty)]) return BASE_SPEED * S.tunnel;
+    if (this.fright) return BASE_SPEED * S.fright;
+    return BASE_SPEED * S.ghost * (this.i === 0 ? 1 + 0.05 * g.elroy : 1); // Cruise Elroy
+  }
+  update(dt) {
+    const g = this.game, doorY = g.level.doorY, exitY = doorY - 1;
+    switch (this.state) {
+      case 'house':
+        this.bob += dt * 5;
+        this.fy = doorY + 2 + Math.sin(this.bob) * 0.22;
+        if (g.roundTime >= this.releaseAt) this.state = 'leaving';
+        break;
+      case 'leaving': {
+        const s = 4 * dt;
+        if (Math.abs(this.fx - 13.5) > 0.01) {
+          this.fx += clamp(13.5 - this.fx, -s, s);
+          this.fy += clamp(doorY + 2 - this.fy, -s, s);
+        } else {
+          this.fx = 13.5; this.fy -= s;
+          if (this.fy <= exitY) { this.state = 'active'; this.place(13.5, exitY, LEFT); }
+        }
+        break;
+      }
+      case 'entering': { // eyes slide through the door, then the ghost revives and leaves again
+        const s = 8 * dt;
+        if (Math.abs(this.fx - 13.5) > 0.01) this.fx += clamp(13.5 - this.fx, -s, s);
+        else { this.fy += s; if (this.fy >= doorY + 2) { this.fy = doorY + 2; this.state = 'leaving'; } }
+        break;
+      }
+      default:
+        this.advance(g.map, this.speed() * dt);
+        this.decayOffset(dt);
+    }
+  }
+  target() {
+    const g = this.game, P = g.player, f = P.facing, px = P.tx, py = P.ty;
+    const corner = { x: this.scatter[0], y: this.scatter[1] };
+    if (g.ghostMode === 'scatter' && !(this.i === 0 && g.elroy > 0)) return corner;
+    switch (this.i) {
+      case 0: return { x: px, y: py };                               // Blinky: the player's tile
+      case 1: return { x: px + 4 * f.x, y: py + 4 * f.y };           // Pinky: 4 tiles ahead
+      case 2: {                                                      // Inky: Blinky->(2 ahead) vector, doubled
+        const b = g.ghosts[0], ax = px + 2 * f.x, ay = py + 2 * f.y;
+        return { x: 2 * ax - b.tx, y: 2 * ay - b.ty };
+      }
+      default: return dist2(this.tx, this.ty, px, py) > 64 ? { x: px, y: py } : corner; // Clyde: shy within 8 tiles
+    }
+  }
+  choose(map) {
+    const opts = DIR_ORDER.filter(d => d !== this.dir.opp && map.passable(this.tx, this.ty, d));
+    if (!opts.length) return map.passable(this.tx, this.ty, this.dir.opp) ? this.dir.opp : NONE;
+    if (this.fright) return pick(opts);
+    const t = this.target();
+    let best = opts[0], bd = Infinity;
+    for (const d of opts) { const v = dist2(this.tx + d.x, this.ty + d.y, t.x, t.y); if (v < bd) { bd = v; best = d; } }
+    return best;
+  }
+  arrive(map) {
+    if (this.state === 'eaten') {
+      if (map.eyes[map.idx(this.tx, this.ty)] === 0) {
+        this.free = true; this.fx = this.tx; this.fy = this.ty; this.state = 'entering';
+        return;
+      }
+      let best = null, bd = Infinity;
+      for (const d of DIR_ORDER) {
+        if (!map.passable(this.tx, this.ty, d)) continue;
+        const v = map.eyes[map.idx(this.tx + d.x, this.ty + d.y)];
+        if (v >= 0 && v < bd) { bd = v; best = d; }
+      }
+      this.dir = best || this.dir.opp;
+      return;
+    }
+    this.dir = this.choose(map);
+  }
+  blocked(map) { this.arrive(map); }
+}
+
+// Boss-stage minion: small, mostly chases, flees while the player is mega-charged.
+class Minion extends Mover {
+  constructor(game, x, y) { super(); this.game = game; this.place(x, y, pick(DIR_ORDER)); this.spawnT = 0; this.dead = false; }
+  get fright() { return this.game.player.power > 0; }
+  update(dt) {
+    const S = this.game.level.speed, phase = this.game.boss.phase;
+    this.spawnT += dt;
+    this.advance(this.game.map, BASE_SPEED * (this.fright ? S.fright : S.minion * (1 + 0.06 * (phase - 1))) * dt);
+  }
+  arrive(map) {
+    const opts = DIR_ORDER.filter(d => d !== this.dir.opp && map.passable(this.tx, this.ty, d));
+    if (!opts.length) { this.dir = map.passable(this.tx, this.ty, this.dir.opp) ? this.dir.opp : NONE; return; }
+    if (this.fright || Math.random() < 0.25) { this.dir = pick(opts); return; }
+    const P = this.game.player;
+    let best = opts[0], bd = Infinity;
+    for (const d of opts) { const v = dist2(this.tx + d.x, this.ty + d.y, P.tx, P.ty); if (v < bd) { bd = v; best = d; } }
+    this.dir = best;
+  }
+  blocked(map) { this.arrive(map); }
+}
+
+/* The Glitch King. Free-moving (not grid-bound) inside the central chamber.
+   Phase 1 (HP 9-7): spawns minions, telegraphed charges across the chamber.
+   Phase 2 (HP 6-4): + energy balls, hazard corridors start electrifying.
+   Phase 3 (HP 3-1): enraged speed, 3-way volleys, telegraphed slowing stomp. */
+class Boss {
+  constructor(game) { this.game = game; this.maxHp = 9; this.hp = 9; this.shownHp = 9; this.phase = 1; this.r = 1.3; this.reset(); }
+  get ch() { return this.game.level.chamber; }
+  reset() {
+    const c = this.ch;
+    this.x = (c.x0 + c.x1) / 2; this.y = c.y0 + this.r + 1;
+    this.state = 'roam'; this.t = 0; this.stun = 0; this.vx = this.vy = 0;
+    this.invuln = 1.5; this.flash = 0; this.cdir = RIGHT;
+    this.timers = { minion: 2.5, charge: 5, shoot: 2.5, stomp: 4 };
+  }
+  clampPos() {
+    const c = this.ch, m = this.r - 0.3;
+    this.x = clamp(this.x, c.x0 + m, c.x1 - m);
+    this.y = clamp(this.y, c.y0 + m, c.y1 - m);
+  }
+  update(dt) {
+    const g = this.game, P = g.player, c = this.ch, T = this.timers;
+    this.flash = Math.max(0, this.flash - dt * 3);
+    this.invuln = Math.max(0, this.invuln - dt);
+    this.shownHp += (this.hp - this.shownHp) * Math.min(1, dt * 2.5);
+    if (this.state === 'dying') {
+      this.t += dt;
+      if (Math.random() < 0.6) g.fx.burst(this.x + rand(-1.6, 1.6), this.y + rand(-1.6, 1.6), pick(['#fff', '#ff3b30', '#ffe600', '#ff2bd6']), 10, 6);
+      g.shake = Math.max(g.shake, 4);
+      if (this.t > 2.8) g.victory();
+      return;
+    }
+    if (this.stun > 0) {
+      this.stun -= dt;
+      this.x += this.vx * dt; this.y += this.vy * dt;
+      this.vx *= Math.exp(-dt * 4); this.vy *= Math.exp(-dt * 4);
+      this.clampPos();
+      return;
+    }
+    for (const k in T) T[k] -= dt;
+    switch (this.state) {
+      case 'roam': {
+        const tx = clamp(P.x, c.x0 + this.r, c.x1 - this.r), ty = clamp(P.y, c.y0 + this.r, c.y1 - this.r);
+        const dx = tx - this.x, dy = ty - this.y, d = Math.hypot(dx, dy), sp = [0, 2.3, 2.8, 3.9][this.phase];
+        if (d > 0.05) { const m = Math.min(d, sp * dt); this.x += dx / d * m; this.y += dy / d * m; }
+        if (T.minion <= 0) {
+          T.minion = [0, 7, 10, 8][this.phase];
+          if (g.minions.length < [0, 3, 3, 4][this.phase]) this.spawnMinion();
+        }
+        if (this.phase >= 2 && T.shoot <= 0) { T.shoot = this.phase === 3 ? 2.6 : 2.1; this.fire(); }
+        if (this.phase === 3 && T.stomp <= 0) { this.state = 'stomp'; this.t = 1.0; g.audio.warn(); break; }
+        if (T.charge <= 0) {
+          const ddx = P.x - this.x, ddy = P.y - this.y;
+          this.cdir = Math.abs(ddx) > Math.abs(ddy) ? (ddx > 0 ? RIGHT : LEFT) : (ddy > 0 ? DOWN : UP);
+          this.state = 'telegraph'; this.t = this.phase === 3 ? 0.55 : 0.85;
+          g.audio.warn();
+        }
+        break;
+      }
+      case 'telegraph':
+        if ((this.t -= dt) <= 0) this.state = 'charge';
+        break;
+      case 'charge': {
+        const sp = this.phase === 3 ? 16 : 13, ox = this.x, oy = this.y;
+        this.x += this.cdir.x * sp * dt; this.y += this.cdir.y * sp * dt;
+        this.clampPos();
+        if (Math.random() < 0.6) g.fx.burst(this.x, this.y, '#ff2bd6', 1, 1);
+        if (Math.abs(this.x - ox) + Math.abs(this.y - oy) < sp * dt * 0.5) { // hit the chamber wall
+          this.state = 'roam'; T.charge = [0, 6, 5, 4][this.phase];
+          g.shake = Math.max(g.shake, 6); g.audio.stomp();
+        }
+        break;
+      }
+      case 'stomp':
+        if ((this.t -= dt) <= 0) {
+          this.state = 'roam'; T.stomp = 5.5;
+          g.shake = 10; g.audio.stomp(); g.fx.ring(this.x, this.y, '#ff3b30', 4.5, 0.5, 4);
+          if (Math.hypot(P.x - this.x, P.y - this.y) < 4.5) { P.slow = 3; g.fx.popup(P.x, P.y - 1, 'SLOWED!', '#7df'); }
+        }
+        break;
+    }
+  }
+  spawnMinion() {
+    const g = this.game, x = clamp(Math.round(this.x), 8, 19), y = clamp(Math.round(this.y), 9, 21);
+    g.minions.push(new Minion(g, x, y));
+    g.fx.burst(x, y, '#7dff5a', 14, 4);
+    g.audio.shoot();
+  }
+  fire() {
+    const g = this.game, P = g.player, a = Math.atan2(P.y - this.y, P.x - this.x);
+    for (const s of this.phase === 3 ? [-0.35, 0, 0.35] : [0]) {
+      g.balls.push({ x: this.x, y: this.y, vx: Math.cos(a + s) * 4.6, vy: Math.sin(a + s) * 4.6, life: 6 });
+    }
+    g.audio.shoot();
+  }
+  damage(n) {
+    const g = this.game;
+    if (this.state === 'dying') return;
+    this.hp = Math.max(0, this.hp - n);
+    this.flash = 1; this.invuln = 1.6; g.shake = 8;
+    g.audio.bossHit();
+    g.fx.burst(this.x, this.y, '#fff', 26, 7);
+    g.addScore(500 * n);
+    g.fx.popup(this.x, this.y - 2, String(500 * n), '#ffe600');
+    if (this.hp <= 0) {
+      this.state = 'dying'; this.t = 0;
+      g.audio.bossRoar(); g.addScore(5000);
+      g.minions.forEach(m => g.fx.burst(m.x, m.y, '#7dff5a', 16, 4));
+      g.minions.length = 0; g.balls.length = 0; g.hazard = null;
+      return;
+    }
+    const np = this.hp > 6 ? 1 : this.hp > 3 ? 2 : 3;
+    if (np !== this.phase) {
+      this.phase = np; this.invuln = 2.2; this.state = 'roam';
+      g.banner(np === 2 ? 'PHASE 2 · HAZARD PROJECTION' : 'PHASE 3 · ENRAGED', 2.4);
+      g.audio.bossRoar();
+      if (np === 2) g.hazard = { phase: 'off', t: 2 };
+    }
+  }
+}
+
+/* =========================================================== EntityManager */
+class EntityManager {
+  constructor(game) { this.game = game; this.player = new Player(game); this.ghosts = []; this.minions = []; this.balls = []; this.boss = null; }
+  setup(level) {
+    this.ghosts = level.boss ? [] : GHOSTS.map((cfg, i) => new Ghost(this.game, cfg, i));
+    this.boss = level.boss ? new Boss(this.game) : null;
+  }
+  resetRound() {
+    this.player.reset(this.game.level);
+    this.ghosts.forEach(g => g.reset());
+    this.minions.length = 0; this.balls.length = 0;
+    if (this.boss) this.boss.reset();
+  }
+  update(dt) {
+    const g = this.game, map = g.map;
+    this.ghosts.forEach(gh => gh.update(dt));
+    this.minions.forEach(m => m.update(dt));
+    if (this.boss) this.boss.update(dt);
+    for (const b of this.balls) {
+      b.x += b.vx * dt; b.y += b.vy * dt; b.life -= dt;
+      if (map.solid(Math.round(b.x), Math.round(b.y))) { b.life = 0; g.fx.burst(b.x, b.y, '#ff2bd6', 6, 3); }
+    }
+    this.balls = this.balls.filter(b => b.life > 0);
+    this.minions = this.minions.filter(m => !m.dead);
+  }
+}
+
+/* ===================================================================== FX
+   Positions are in tile units, same as actors.                            */
+class FX {
+  constructor() { this.parts = []; this.rings = []; this.bolts = []; this.pops = []; }
+  clear() { this.parts.length = this.rings.length = this.bolts.length = this.pops.length = 0; }
+  burst(x, y, color, n = 12, speed = 4) {
+    for (let i = 0; i < n && this.parts.length < 900; i++) {
+      const a = Math.random() * Math.PI * 2, s = speed * rand(0.3, 1), life = rand(0.35, 0.9);
+      this.parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life, max: life, color, size: Math.random() < 0.3 ? 3 : 2 });
+    }
+  }
+  ring(x, y, color, max = 1.4, life = 0.45, width = 2) { this.rings.push({ x, y, color, max, life, t: life, width }); }
+  bolt(x1, y1, x2, y2) {
+    const pts = [], n = 14;
+    for (let i = 0; i <= n; i++) {
+      const k = i / n, j = i && i < n ? 0.7 : 0;
+      pts.push({ x: x1 + (x2 - x1) * k + rand(-j, j), y: y1 + (y2 - y1) * k + rand(-j, j) });
+    }
+    this.bolts.push({ pts, life: 0.5 });
+  }
+  popup(x, y, text, color = '#2af6ff') { this.pops.push({ x, y, text, color, life: 1.1 }); }
+  update(dt) {
+    const drag = Math.exp(-dt * 2.5);
+    for (const p of this.parts) { p.x += p.vx * dt; p.y += p.vy * dt; p.vx *= drag; p.vy *= drag; p.life -= dt; }
+    for (const r of this.rings) r.t -= dt;
+    for (const b of this.bolts) b.life -= dt;
+    for (const p of this.pops) { p.y -= dt * 1.2; p.life -= dt; }
+    this.parts = this.parts.filter(p => p.life > 0);
+    this.rings = this.rings.filter(r => r.t > 0);
+    this.bolts = this.bolts.filter(b => b.life > 0);
+    this.pops = this.pops.filter(p => p.life > 0);
+  }
+  draw(ctx) {
+    const P = v => v * TS + TS / 2;
+    for (const p of this.parts) {
+      ctx.globalAlpha = p.life / p.max; ctx.fillStyle = p.color;
+      ctx.fillRect(P(p.x) - p.size / 2, P(p.y) - p.size / 2, p.size, p.size);
+    }
+    for (const r of this.rings) {
+      const k = 1 - r.t / r.life;
+      ctx.globalAlpha = 1 - k; ctx.strokeStyle = r.color; ctx.lineWidth = r.width;
+      ctx.beginPath(); ctx.arc(P(r.x), P(r.y), Math.max(0.1, k * r.max * TS), 0, Math.PI * 2); ctx.stroke();
+    }
+    for (const b of this.bolts) {
+      ctx.globalAlpha = b.life / 0.5; ctx.strokeStyle = '#fff'; ctx.lineWidth = 2.5;
+      ctx.shadowColor = '#7df'; ctx.shadowBlur = 14;
+      ctx.beginPath();
+      b.pts.forEach((p, i) => (i ? ctx.lineTo(P(p.x), P(p.y)) : ctx.moveTo(P(p.x), P(p.y))));
+      ctx.stroke(); ctx.shadowBlur = 0;
+    }
+    for (const p of this.pops) {
+      ctx.globalAlpha = Math.min(1, p.life * 2);
+      drawText(ctx, p.text, P(p.x), P(p.y), { size: 10, color: p.color, glow: 6 });
+    }
+    ctx.globalAlpha = 1;
+  }
+}
+
+/* ========================================================= drawing helpers */
+function drawText(ctx, s, x, y, { size = 12, color = '#fff', align = 'center', glow = 0, weight = 'bold' } = {}) {
+  ctx.font = `${weight} ${size}px "Courier New", Courier, monospace`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = color;
+  if (glow) { ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  ctx.fillText(s, x, y);
+  ctx.shadowBlur = 0;
+}
+// Text on a dark backing plate so it reads over the maze.
+function drawLabel(ctx, s, x, y, opts = {}) {
+  const size = opts.size || 12;
+  ctx.font = `bold ${size}px "Courier New", Courier, monospace`;
+  const w = ctx.measureText(s).width + 12;
+  ctx.fillStyle = 'rgba(0,0,0,.78)';
+  ctx.fillRect(x - w / 2, y - size * 0.75, w, size * 1.5);
+  drawText(ctx, s, x, y, opts);
+}
+function drawPac(ctx, x, y, r, ang, mouth, color = '#ffe600', glow = 8) {
+  ctx.fillStyle = color;
+  if (glow) { ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  ctx.beginPath(); ctx.moveTo(x, y);
+  ctx.arc(x, y, r, ang + mouth, ang + Math.PI * 2 - mouth);
+  ctx.closePath(); ctx.fill();
+  ctx.shadowBlur = 0;
+}
+function ghostBody(ctx, px, py, r, color, t, alpha = 1, glow = 10) {
+  const a0 = ctx.globalAlpha;
+  ctx.globalAlpha = a0 * alpha; ctx.fillStyle = color;
+  if (glow) { ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  ctx.beginPath();
+  ctx.arc(px, py - r * 0.1, r, Math.PI, 0);
+  const bottom = py + r * 0.9, wave = Math.floor(t * 8) % 2;
+  ctx.lineTo(px + r, bottom);
+  for (let i = 1; i <= 6; i++) ctx.lineTo(px + r - i * (r / 3), bottom - ((i + wave) % 2 ? r * 0.28 : 0));
+  ctx.closePath(); ctx.fill();
+  ctx.shadowBlur = 0; ctx.globalAlpha = a0;
+}
+// mode: 'normal' | 'fright' | 'flash' | 'eyes'
+function drawGhost(ctx, x, y, color, dir, mode, t, scale = 1, alpha = 1) {
+  const px = x * TS + TS / 2, py = y * TS + TS / 2, r = 7 * scale, a0 = ctx.globalAlpha;
+  ctx.globalAlpha = a0 * alpha;
+  if (mode !== 'eyes') ghostBody(ctx, px, py, r, mode === 'fright' ? '#2236ff' : mode === 'flash' ? '#f0f0ff' : color, t);
+  if (mode === 'fright' || mode === 'flash') {
+    const fc = mode === 'fright' ? '#ffc8c8' : '#ff2a2a';
+    ctx.fillStyle = fc;
+    ctx.fillRect(px - 3.5 * scale, py - 3 * scale, 2 * scale, 2 * scale);
+    ctx.fillRect(px + 1.5 * scale, py - 3 * scale, 2 * scale, 2 * scale);
+    ctx.strokeStyle = fc; ctx.lineWidth = 1; ctx.beginPath();
+    for (let i = 0; i <= 6; i++) {
+      const xx = px - 4.5 * scale + i * 1.5 * scale, yy = py + 2.5 * scale + (i % 2 ? -1 : 1) * scale;
+      i ? ctx.lineTo(xx, yy) : ctx.moveTo(xx, yy);
+    }
+    ctx.stroke();
+  } else {
+    for (const s of [-1, 1]) {
+      const ex = px + s * 2.8 * scale, ey = py - 1.8 * scale;
+      ctx.fillStyle = '#fff';
+      ctx.beginPath(); ctx.ellipse(ex, ey, 2.3 * scale, 2.9 * scale, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#1a2cff';
+      ctx.beginPath(); ctx.arc(ex + dir.x * 1.2 * scale, ey + dir.y * 1.4 * scale, 1.35 * scale, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+  ctx.globalAlpha = a0;
+}
+function drawFruit(ctx, kind, px, py) {
+  ctx.lineWidth = 1.5;
+  if (kind === 0) { // cherries
+    ctx.strokeStyle = '#4ad04a';
+    ctx.beginPath(); ctx.moveTo(px + 3, py - 6); ctx.quadraticCurveTo(px - 2, py - 4, px - 3, py + 1);
+    ctx.moveTo(px + 3, py - 6); ctx.quadraticCurveTo(px + 4, py - 2, px + 4, py + 2); ctx.stroke();
+    ctx.fillStyle = '#ff1f3d';
+    for (const [cx, cy] of [[px - 3, py + 3], [px + 4, py + 4]]) { ctx.beginPath(); ctx.arc(cx, cy, 3.3, 0, Math.PI * 2); ctx.fill(); }
+    ctx.fillStyle = '#fff'; ctx.fillRect(px - 4.5, py + 1.5, 1.2, 1.2); ctx.fillRect(px + 2.5, py + 2.5, 1.2, 1.2);
+  } else if (kind === 1) { // strawberry
+    ctx.fillStyle = '#ff2448';
+    ctx.beginPath(); ctx.moveTo(px - 6, py - 2); ctx.quadraticCurveTo(px, py - 6, px + 6, py - 2);
+    ctx.quadraticCurveTo(px + 4, py + 5, px, py + 7); ctx.quadraticCurveTo(px - 4, py + 5, px - 6, py - 2); ctx.fill();
+    ctx.fillStyle = '#4ad04a';
+    ctx.beginPath(); ctx.moveTo(px - 4, py - 4); ctx.lineTo(px, py - 7); ctx.lineTo(px + 4, py - 4); ctx.lineTo(px, py - 2); ctx.fill();
+    ctx.fillStyle = '#ffe9a8';
+    for (const [sx, sy] of [[-3, 0], [0, 1], [3, 0], [-1, 4], [2, 4]]) ctx.fillRect(px + sx, py + sy, 1, 1);
+  } else { // orange
+    ctx.fillStyle = '#ff9a1f';
+    ctx.beginPath(); ctx.arc(px, py + 1, 5.5, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#4ad04a';
+    ctx.beginPath(); ctx.ellipse(px + 2.5, py - 5, 3, 1.5, -0.5, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,.6)'; ctx.fillRect(px - 3, py - 2, 1.5, 1.5);
+  }
+}
+// Draw something at x, and again on the far side when it is half inside a wrap tunnel.
+function wrapDraw(x, fn) { fn(x); if (x < 1) fn(x + COLS); else if (x > COLS - 2) fn(x - COLS); }
+
+/* =============================================================== UIManager */
+class UIManager {
+  constructor(game, canvas) {
+    this.game = game; this.canvas = canvas; this.ctx = canvas.getContext('2d'); this.k = 0;
+    this.stage = $('#stage');
+    this.btn = { sound: $('#btn-sound'), crt: $('#btn-crt'), pause: $('#btn-pause'), dpad: $('#btn-dpad') };
+    this.crt = store.get('crt', '1') === '1';
+    const touch = matchMedia('(pointer: coarse)').matches || navigator.maxTouchPoints > 0;
+    this.dpad = store.get('dpad', touch ? '1' : '0') === '1';
+    const click = (b, fn) => b.addEventListener('click', e => { fn(); e.currentTarget.blur(); });
+    click(this.btn.sound, () => game.action('mute'));
+    click(this.btn.crt, () => game.action('crt'));
+    click(this.btn.pause, () => game.action('pause'));
+    click(this.btn.dpad, () => this.toggleDpad());
+    let pending = false;
+    addEventListener('resize', () => { if (!pending) { pending = true; requestAnimationFrame(() => { pending = false; this.fit(); }); } });
+    this.syncButtons();
+    this.fit();
+  }
+  toggleCrt() { this.crt = !this.crt; store.set('crt', this.crt ? 1 : 0); this.syncButtons(); }
+  toggleDpad() { this.dpad = !this.dpad; store.set('dpad', this.dpad ? 1 : 0); this.syncButtons(); this.fit(); }
+  syncButtons() {
+    const g = this.game, set = (b, on, label) => { b.textContent = `${label}: ${on ? 'ON' : 'OFF'}`; b.setAttribute('aria-pressed', String(on)); };
+    set(this.btn.sound, !g.audio.muted, 'SOUND');
+    set(this.btn.crt, this.crt, 'CRT');
+    set(this.btn.dpad, this.dpad, 'D-PAD');
+    this.btn.pause.textContent = g.paused ? 'RESUME' : 'PAUSE';
+    this.stage.classList.toggle('crt-on', this.crt);
+    document.body.classList.toggle('dpad-on', this.dpad);
+  }
+  // Size the stage to the viewport and render at device resolution so it stays crisp at any size.
+  fit() {
+    const ctl = $('#controls').offsetHeight, dp = $('#dpad');
+    const dpH = this.dpad && getComputedStyle(dp).position !== 'fixed' ? dp.offsetHeight + 10 : 0;
+    const s = Math.max(0.25, Math.min((innerWidth - 32) / VIEW_W, (innerHeight - ctl - dpH - 30) / VIEW_H));
+    this.stage.style.width = Math.floor(VIEW_W * s) + 'px';
+    this.stage.style.height = Math.floor(VIEW_H * s) + 'px';
+    const k = Math.min(4, s * (window.devicePixelRatio || 1));
+    if (Math.abs(k - this.k) > 0.01) {
+      this.k = k;
+      this.canvas.width = Math.round(VIEW_W * k); this.canvas.height = Math.round(VIEW_H * k);
+      if (this.game.map.grid) this.buildMaze();
+    }
+  }
+  buildMaze() {
+    const L = this.game.level;
+    this.mazeImg = this.paintMaze(L.wall, L.fill);
+    this.flashImg = this.paintMaze('#ffffff', '#1a1a2a');
+  }
+  // Pre-render walls once per level: glowing solid fill, then an inset dark fill leaves a neon outline.
+  paintMaze(color, fill) {
+    const map = this.game.map, c = document.createElement('canvas');
+    c.width = Math.round(COLS * TS * this.k); c.height = Math.round(ROWS * TS * this.k);
+    const g = c.getContext('2d'), B = 3;
+    g.scale(this.k, this.k);
+    const wall = (x, y) => x < 0 || x >= COLS || y < 0 || y >= ROWS || map.grid[y][x] === '#';
+    g.fillStyle = color; g.shadowColor = color; g.shadowBlur = 10;
+    for (let y = 0; y < ROWS; y++) for (let x = 0; x < COLS; x++) if (wall(x, y)) g.fillRect(x * TS, y * TS, TS, TS);
+    g.shadowBlur = 0; g.fillStyle = fill;
+    for (let y = 0; y < ROWS; y++) for (let x = 0; x < COLS; x++) {
+      if (!wall(x, y)) continue;
+      // -0.5 overlaps neighbouring wall fills so fractional scaling leaves no seams
+      const l = wall(x - 1, y) ? -0.5 : B, r = wall(x + 1, y) ? -0.5 : B, t = wall(x, y - 1) ? -0.5 : B, b = wall(x, y + 1) ? -0.5 : B;
+      g.fillRect(x * TS + l, y * TS + t, TS - l - r, TS - t - b);
+    }
+    g.fillStyle = color; // concave corners lost by the inset pass
+    for (let y = 0; y < ROWS; y++) for (let x = 0; x < COLS; x++) {
+      if (!wall(x, y)) continue;
+      for (const dx of [-1, 1]) for (const dy of [-1, 1]) {
+        if (wall(x + dx, y) && wall(x, y + dy) && !wall(x + dx, y + dy)) g.fillRect(dx > 0 ? x * TS + TS - B : x * TS, dy > 0 ? y * TS + TS - B : y * TS, B, B);
+      }
+    }
+    g.fillStyle = '#ffb8ff';
+    for (let y = 0; y < ROWS; y++) for (let x = 0; x < COLS; x++) if (map.grid[y][x] === '-') g.fillRect(x * TS, y * TS + TS / 2 - 2, TS, 4);
+    return c;
+  }
+
+  render() {
+    const g = this.game, ctx = this.ctx, t = g.time;
+    ctx.setTransform(this.k, 0, 0, this.k, 0, 0);
+    ctx.fillStyle = '#000'; ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+    if (g.state === 'title') { this.drawTitle(ctx, t); return; }
+    const sx = g.shake ? rand(-0.5, 0.5) * g.shake : 0, sy = g.shake ? rand(-0.5, 0.5) * g.shake : 0;
+    ctx.save();
+    ctx.translate(sx, HUD_TOP + sy);
+    ctx.beginPath(); ctx.rect(0, 0, COLS * TS, ROWS * TS); ctx.clip();
+    const flash = g.state === 'clear' && g.stateTimer < 2.1 && Math.floor(t * 6) % 2 === 0;
+    ctx.drawImage(flash ? this.flashImg : this.mazeImg, 0, 0, COLS * TS, ROWS * TS);
+    this.drawSpecials(ctx, t);
+    this.drawDots(ctx, t);
+    if (g.fruit && (g.fruit.t > 2 || Math.floor(t * 8) % 2)) drawFruit(ctx, g.fruit.kind, g.fruit.x * TS + 8, g.fruit.y * TS + 8);
+    this.drawEntities(ctx, t);
+    if (g.level.dark) this.drawDarkness(ctx);
+    g.fx.draw(ctx);
+    ctx.restore();
+    this.drawHud(ctx, t);
+    this.drawOverlay(ctx, t);
+  }
+  drawDots(ctx, t) {
+    const g = this.game, map = g.map, blinkOn = g.state !== 'play' || Math.floor(t * 5) % 2 === 0;
+    ctx.fillStyle = g.level.dot;
+    for (let i = 0; i < map.dots.length; i++) {
+      const d = map.dots[i];
+      if (!d) continue;
+      const px = (i % COLS) * TS + 8, py = ((i / COLS) | 0) * TS + 8;
+      if (d === 1) ctx.fillRect(px - 1.5, py - 1.5, 3, 3);
+      else if (d === 2) {
+        if (!blinkOn) continue;
+        ctx.shadowColor = g.level.dot; ctx.shadowBlur = 10;
+        ctx.beginPath(); ctx.arc(px, py, 5, 0, Math.PI * 2); ctx.fill();
+        ctx.shadowBlur = 0;
+      } else { // mega-energizer: pulsing, colour-cycling orb
+        const col = `hsl(${(t * 200) % 360},100%,65%)`;
+        ctx.fillStyle = col; ctx.shadowColor = col; ctx.shadowBlur = 16;
+        ctx.beginPath(); ctx.arc(px, py, 5.5 + Math.sin(t * 8) * 1.3, 0, Math.PI * 2); ctx.fill();
+        ctx.shadowBlur = 0; ctx.fillStyle = '#fff';
+        ctx.beginPath(); ctx.arc(px, py, 2, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = g.level.dot;
+      }
+    }
+  }
+  drawSpecials(ctx, t) {
+    const g = this.game, map = g.map;
+    for (const s of map.specials) {
+      const px = s.x * TS, py = s.y * TS, cx = px + 8, cy = py + 8;
+      switch (s.c) {
+        case '=': // speed strip: a wave of light flowing along the strip
+          ctx.fillStyle = `rgba(56,249,255,${0.1 + 0.22 * (0.5 + 0.5 * Math.sin(t * 7 - s.y * 0.8))})`;
+          ctx.fillRect(px + 1, py + 1, TS - 2, TS - 2);
+          break;
+        case '<': case '>': case '^': case 'v':
+          ctx.save(); ctx.translate(cx, cy); ctx.rotate(ONEWAY[s.c].a);
+          ctx.strokeStyle = '#39ff9c'; ctx.lineWidth = 2; ctx.globalAlpha = 0.55 + 0.45 * Math.sin(t * 6);
+          for (const o of [-3, 2]) { ctx.beginPath(); ctx.moveTo(o - 2, -4); ctx.lineTo(o + 2, 0); ctx.lineTo(o - 2, 4); ctx.stroke(); }
+          ctx.restore();
+          break;
+        case '1': case '2': {
+          const col = s.c === '1' ? '#38f9ff' : '#ff9f1a';
+          ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.shadowColor = col; ctx.shadowBlur = 8;
+          ctx.setLineDash([3, 3]); ctx.lineDashOffset = -t * 18;
+          ctx.beginPath(); ctx.arc(cx, cy, 6, 0, Math.PI * 2); ctx.stroke();
+          ctx.setLineDash([]); ctx.shadowBlur = 0;
+          ctx.fillStyle = col; ctx.globalAlpha = 0.35 + 0.25 * Math.sin(t * 5);
+          ctx.beginPath(); ctx.arc(cx, cy, 3, 0, Math.PI * 2); ctx.fill();
+          ctx.globalAlpha = 1;
+          break;
+        }
+        case 'x': {
+          const ph = g.hazard ? g.hazard.phase : 'off';
+          if (ph === 'on') {
+            ctx.fillStyle = 'rgba(120,200,255,.35)'; ctx.fillRect(px, py, TS, TS);
+            ctx.strokeStyle = '#e8f6ff'; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(px, cy + rand(-5, 5));
+            for (let i = 1; i <= 4; i++) ctx.lineTo(px + i * 4, cy + rand(-6, 6));
+            ctx.stroke();
+          } else if (ph === 'warn') {
+            if (Math.floor(t * 10) % 2 === 0) { ctx.fillStyle = 'rgba(255,214,0,.4)'; ctx.fillRect(px + 1, py + 1, TS - 2, TS - 2); }
+          } else {
+            ctx.strokeStyle = 'rgba(255,59,48,.35)'; ctx.lineWidth = 1; ctx.beginPath();
+            ctx.moveTo(px + 4, py + 4); ctx.lineTo(px + 12, py + 12); ctx.moveTo(px + 12, py + 4); ctx.lineTo(px + 4, py + 12); ctx.stroke();
+          }
+          break;
+        }
+        case 'N': {
+          const armed = map.armed, r = armed ? 6 + Math.sin(t * 8) : 5;
+          ctx.fillStyle = armed ? '#ffd400' : '#3a3a48';
+          if (armed) { ctx.shadowColor = '#ffd400'; ctx.shadowBlur = 14 + 6 * Math.sin(t * 8); }
+          ctx.beginPath(); ctx.moveTo(cx, cy - r); ctx.lineTo(cx + r, cy); ctx.lineTo(cx, cy + r); ctx.lineTo(cx - r, cy); ctx.closePath(); ctx.fill();
+          ctx.shadowBlur = 0; ctx.strokeStyle = armed ? '#fff' : '#777'; ctx.lineWidth = 1; ctx.stroke();
+          break;
+        }
+      }
+    }
+  }
+  frightMode(timeLeft) { return timeLeft < 2 && Math.floor(timeLeft * 5) % 2 === 0 ? 'flash' : 'fright'; }
+  drawEntities(ctx, t) {
+    const g = this.game, P = g.player;
+    const showGhosts = g.state !== 'clear' && g.state !== 'victory' && !(g.state === 'dying' && g.deathT > 0.6);
+    if (g.boss) this.drawBossLayer(ctx, t);
+    if (showGhosts) {
+      for (const m of g.minions) {
+        const mode = m.fright ? this.frightMode(P.power) : 'normal';
+        wrapDraw(m.x, x => drawGhost(ctx, x, m.y, '#7dff5a', m.dir, mode, t, 0.8, Math.min(1, m.spawnT / 0.6)));
+      }
+      for (const gh of g.ghosts) {
+        if (gh === g.freezeGhost) continue;
+        const mode = gh.state === 'eaten' || gh.state === 'entering' ? 'eyes' : gh.fright ? this.frightMode(g.frightTimer) : 'normal';
+        wrapDraw(gh.x, x => drawGhost(ctx, x, gh.y, gh.color, gh.lookDir, mode, t));
+      }
+    }
+    this.drawPlayer(ctx, t);
+  }
+  drawPlayer(ctx, t) {
+    const g = this.game, P = g.player;
+    if (g.state === 'dying' && g.deathT > 0.6) { // death swirl: spin while the mouth opens until nothing is left
+      const k = clamp((g.deathT - 0.6) / 1.4, 0, 1);
+      if (k >= 1) return;
+      wrapDraw(P.x, x => {
+        ctx.save(); ctx.translate(x * TS + 8, P.y * TS + 8); ctx.rotate(k * Math.PI * 5);
+        drawPac(ctx, 0, 0, 7 * (1 - k * 0.4), -Math.PI / 2, 0.1 + k * (Math.PI - 0.1));
+        ctx.restore();
+      });
+      return;
+    }
+    const mouth = g.state === 'ready' ? 0 : P.dir === NONE ? 0.3 : 0.05 + Math.abs(Math.sin(P.chomp * Math.PI)) * 0.8;
+    wrapDraw(P.x, x => {
+      const px = x * TS + 8, py = P.y * TS + 8;
+      if (P.power > 0 && (P.power > 2 || Math.floor(t * 10) % 2)) {
+        ctx.fillStyle = `rgba(255,230,0,${0.2 + 0.12 * Math.sin(t * 12)})`;
+        ctx.beginPath(); ctx.arc(px, py, 12, 0, Math.PI * 2); ctx.fill();
+      }
+      if (P.slow > 0) {
+        ctx.strokeStyle = 'rgba(120,220,255,.85)'; ctx.lineWidth = 1.5; ctx.setLineDash([2, 3]);
+        ctx.beginPath(); ctx.arc(px, py, 10, t * 4, t * 4 + Math.PI * 2); ctx.stroke(); ctx.setLineDash([]);
+      }
+      drawPac(ctx, px, py, 7, P.facing.a, mouth);
+    });
+  }
+  drawBossLayer(ctx, t) {
+    const g = this.game, B = g.boss, c = g.level.chamber, T = v => v * TS + 8;
+    if (B.state === 'telegraph' && Math.floor(t * 12) % 2 === 0) { // charge lane warning
+      ctx.fillStyle = 'rgba(255,40,90,.28)';
+      if (B.cdir.x) {
+        const a = B.cdir.x > 0 ? B.x : c.x0 + 0.5, b = B.cdir.x > 0 ? c.x1 - 0.5 : B.x;
+        ctx.fillRect(T(a) - 8, T(B.y) - B.r * TS, (b - a) * TS + 16, B.r * TS * 2);
+      } else {
+        const a = B.cdir.y > 0 ? B.y : c.y0 + 0.5, b = B.cdir.y > 0 ? c.y1 - 0.5 : B.y;
+        ctx.fillRect(T(B.x) - B.r * TS, T(a) - 8, B.r * TS * 2, (b - a) * TS + 16);
+      }
+    }
+    if (B.state === 'stomp') { // stomp blast radius, filling up as it charges
+      const k = 1 - B.t, R = 4.5 * TS;
+      ctx.fillStyle = `rgba(255,30,30,${0.08 + 0.2 * k})`;
+      ctx.beginPath(); ctx.arc(T(B.x), T(B.y), R, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = '#ff3b30'; ctx.lineWidth = 2; ctx.setLineDash([6, 4]); ctx.lineDashOffset = t * 30;
+      ctx.stroke(); ctx.setLineDash([]);
+      ctx.beginPath(); ctx.arc(T(B.x), T(B.y), R * k, 0, Math.PI * 2); ctx.stroke();
+    }
+    for (const b of g.balls) {
+      ctx.fillStyle = '#ff2bd6'; ctx.shadowColor = '#ff2bd6'; ctx.shadowBlur = 12;
+      ctx.beginPath(); ctx.arc(T(b.x), T(b.y), 4.5, 0, Math.PI * 2); ctx.fill();
+      ctx.shadowBlur = 0; ctx.fillStyle = '#fff';
+      ctx.beginPath(); ctx.arc(T(b.x), T(b.y), 1.8, 0, Math.PI * 2); ctx.fill();
+    }
+    this.drawBoss(ctx, B, t);
+  }
+  drawBoss(ctx, B, t) {
+    const g = this.game, P = g.player, px = B.x * TS + 8, py = B.y * TS + 8;
+    let r = B.r * TS;
+    ctx.save();
+    if (B.state === 'dying') { const k = Math.min(1, B.t / 2.8); ctx.globalAlpha = 1 - k * 0.9; r *= 1 + k * 0.4; }
+    else if (B.invuln > 0 && Math.floor(t * 14) % 2) ctx.globalAlpha = 0.5;
+    const col = B.flash > 0.5 ? '#ffffff' : BOSS_COLORS[B.phase];
+    const jit = B.phase === 3 || Math.random() < 0.15 ? rand(1, 3.5) : 1;
+    ctx.globalCompositeOperation = 'lighter'; // chromatic glitch split
+    ghostBody(ctx, px - jit - 1, py, r, '#ff0055', t, 0.45, 0);
+    ghostBody(ctx, px + jit + 1, py, r, '#00d5ff', t, 0.45, 0);
+    ctx.globalCompositeOperation = 'source-over';
+    ghostBody(ctx, px, py, r, col, t, 1, 18);
+    // crown
+    const cy = py - r * 0.95;
+    ctx.fillStyle = '#ffd400'; ctx.shadowColor = '#ffd400'; ctx.shadowBlur = 8;
+    ctx.beginPath();
+    ctx.moveTo(px - r * 0.6, cy + 4); ctx.lineTo(px - r * 0.6, cy - 6); ctx.lineTo(px - r * 0.3, cy - 1);
+    ctx.lineTo(px, cy - 10); ctx.lineTo(px + r * 0.3, cy - 1); ctx.lineTo(px + r * 0.6, cy - 6); ctx.lineTo(px + r * 0.6, cy + 4);
+    ctx.closePath(); ctx.fill(); ctx.shadowBlur = 0;
+    ctx.fillStyle = '#ff2244'; ctx.beginPath(); ctx.arc(px, cy, 2, 0, Math.PI * 2); ctx.fill();
+    // angry eyes tracking the player
+    const ang = Math.atan2(P.y - B.y, P.x - B.x);
+    for (const s of [-1, 1]) {
+      const ex = px + s * r * 0.38, ey = py - r * 0.2;
+      ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.ellipse(ex, ey, r * 0.22, r * 0.26, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = B.phase === 3 ? '#ffe600' : '#200010';
+      ctx.beginPath(); ctx.arc(ex + Math.cos(ang) * r * 0.09, ey + Math.sin(ang) * r * 0.1, r * 0.1, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = '#1a0010'; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(ex - s * r * 0.3, ey - r * 0.4); ctx.lineTo(ex + s * r * 0.18, ey - r * 0.2); ctx.stroke();
+    }
+    // jagged mouth
+    const mw = r * 0.9, my = py + r * 0.3, mh = r * 0.26 + (B.state === 'telegraph' || B.state === 'stomp' ? r * 0.12 : 0);
+    ctx.fillStyle = '#1a0010'; ctx.fillRect(px - mw / 2, my, mw, mh);
+    ctx.fillStyle = '#fff';
+    for (let i = 0; i < 5; i++) {
+      const x0 = px - mw / 2 + i * (mw / 5);
+      ctx.beginPath(); ctx.moveTo(x0, my); ctx.lineTo(x0 + mw / 10, my + mh * 0.5); ctx.lineTo(x0 + mw / 5, my); ctx.fill();
+    }
+    // horizontal glitch slices
+    if (Math.random() < 0.25) {
+      ctx.globalAlpha *= 0.6;
+      for (let i = 0; i < 3; i++) { ctx.fillStyle = pick(['#00d5ff', '#ff0055', '#fff']); ctx.fillRect(px - r + rand(-4, 4), py + rand(-r, r), r * 2 * rand(0.4, 1), rand(1, 3)); }
+    }
+    ctx.restore();
+    if (B.stun > 0) for (let i = 0; i < 3; i++) {
+      const a = t * 6 + i * 2.09;
+      drawText(ctx, '*', px + Math.cos(a) * r * 0.9, py - r * 1.25 + Math.sin(a) * 4, { size: 12, color: '#ffe600' });
+    }
+  }
+  // Labyrinth of Shadows: everything outside the player's lantern fades to black; ghost eyes still glint.
+  drawDarkness(ctx) {
+    const g = this.game, P = g.player, cx = P.x * TS + 8, cy = P.y * TS + 8;
+    const R = (g.frightTimer > 0 ? 9 : 6.5) * TS;
+    const grad = ctx.createRadialGradient(cx, cy, TS * 1.5, cx, cy, R);
+    grad.addColorStop(0, 'rgba(0,0,0,0)'); grad.addColorStop(1, 'rgba(2,0,8,0.9)');
+    ctx.fillStyle = grad; ctx.fillRect(0, 0, COLS * TS, ROWS * TS);
+    if (g.state === 'clear' || (g.state === 'dying' && g.deathT > 0.6)) return;
+    for (const gh of g.ghosts) {
+      if (gh === g.freezeGhost || gh.fright) continue;
+      wrapDraw(gh.x, x => drawGhost(ctx, x, gh.y, gh.color, gh.lookDir, 'eyes', g.time, 1, 0.8));
+    }
+  }
+  drawHud(ctx, t) {
+    const g = this.game, L = g.level, mid = VIEW_W / 2;
+    drawText(ctx, 'SCORE', 16, 10, { size: 9, color: '#7f9bb5', align: 'left' });
+    drawText(ctx, String(g.score), 16, 24, { size: 15, align: 'left' });
+    drawText(ctx, 'HI-SCORE', mid, 10, { size: 9, color: '#7f9bb5' });
+    drawText(ctx, String(Math.max(g.hi, g.score)), mid, 24, { size: 15, color: '#ffe600' });
+    drawText(ctx, 'STAGE', VIEW_W - 16, 10, { size: 9, color: '#7f9bb5', align: 'right' });
+    drawText(ctx, `${g.levelIndex + 1}/${LEVELS.length}`, VIEW_W - 16, 24, { size: 15, align: 'right' });
+    if (g.boss) {
+      const B = g.boss, x0 = 118, w = VIEW_W - 16 - x0, y = 39, h = 10, jx = B.flash > 0 ? rand(-2, 2) : 0, col = BOSS_COLORS[B.phase];
+      drawText(ctx, 'GLITCH KING', 16, 44, { size: 11, color: col, align: 'left', glow: 6 });
+      ctx.fillStyle = '#2a0008'; ctx.fillRect(x0 + jx, y, w, h);
+      ctx.fillStyle = '#fff'; ctx.fillRect(x0 + jx, y, w * B.shownHp / B.maxHp, h); // lagging "damage" bar
+      ctx.fillStyle = col; ctx.shadowColor = col; ctx.shadowBlur = 8;
+      ctx.fillRect(x0 + jx, y, w * B.hp / B.maxHp, h); ctx.shadowBlur = 0;
+      ctx.fillStyle = '#000';
+      for (const k of [3, 6]) ctx.fillRect(x0 + jx + w * k / B.maxHp - 1, y, 2, h); // phase thresholds
+      ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.lineWidth = 1; ctx.strokeRect(x0 + jx + 0.5, y + 0.5, w - 1, h - 1);
+    } else {
+      drawText(ctx, L.name, mid, 44, { size: 11, color: L.wall, glow: 8 });
+    }
+    const by = HUD_TOP + ROWS * TS + HUD_BOTTOM / 2;
+    for (let i = 0; i < Math.min(g.lives - 1, 6); i++) drawPac(ctx, 22 + i * 20, by, 6, Math.PI, 0.55, '#ffe600', 0);
+    for (let i = 0; i <= Math.min(g.levelIndex, 2); i++) drawFruit(ctx, i, VIEW_W - 22 - i * 22, by);
+    if (g.player.power > 0) { // mega-charge meter (boss stage)
+      const w = 120, x0 = mid - w / 2;
+      ctx.fillStyle = '#332b00'; ctx.fillRect(x0, by - 3, w, 6);
+      ctx.fillStyle = '#ffe600'; ctx.fillRect(x0, by - 3, w * g.player.power / 8, 6);
+      drawText(ctx, 'MEGA', x0 - 22, by, { size: 9, color: '#ffe600' });
+    }
+  }
+  drawOverlay(ctx, t) {
+    const g = this.game, L = g.level, rowY = r => HUD_TOP + r * TS + 8, my = rowY(L.msgY);
+    switch (g.state) {
+      case 'ready':
+        drawLabel(ctx, `STAGE ${g.levelIndex + 1} · ${L.name}`, VIEW_W / 2, HUD_TOP + 22, { size: 11, color: '#2af6ff' });
+        drawLabel(ctx, 'READY!', VIEW_W / 2, my, { size: 16, color: '#ffe600', glow: 10 });
+        drawLabel(ctx, L.hint, VIEW_W / 2, my + 20, { size: 9, color: '#d8f6ff' });
+        break;
+      case 'clear':
+        drawLabel(ctx, 'STAGE CLEAR!', VIEW_W / 2, my, { size: 16, color: '#ffe600', glow: 10 });
+        break;
+      case 'gameover':
+        drawLabel(ctx, 'GAME OVER', VIEW_W / 2, my, { size: 18, color: '#ff3b30', glow: 10 });
+        if (g.newHi) drawLabel(ctx, 'NEW HIGH SCORE!', VIEW_W / 2, my + 22, { size: 11, color: '#ffe600' });
+        if (g.stateTimer <= 0 && Math.floor(t * 2) % 2 === 0) drawLabel(ctx, 'PRESS ENTER OR TAP', VIEW_W / 2, my + 42, { size: 10 });
+        break;
+      case 'bossintro': {
+        ctx.fillStyle = `rgba(255,0,30,${0.12 + 0.1 * Math.sin(t * 10)})`; ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+        const cy = VIEW_H / 2;
+        ctx.fillStyle = 'rgba(0,0,0,.75)'; ctx.fillRect(0, cy - 70, VIEW_W, 150);
+        if (Math.floor(t * 4) % 2 === 0) drawText(ctx, '! WARNING !', VIEW_W / 2, cy - 42, { size: 30, color: '#ff3b30', glow: 16 });
+        drawText(ctx, 'THE GLITCH KING AWAKENS', VIEW_W / 2, cy - 8, { size: 14, color: '#ffd400', glow: 8 });
+        drawText(ctx, 'EAT A MEGA-ENERGIZER (CORNERS), THEN RAM HIM', VIEW_W / 2, cy + 22, { size: 10 });
+        drawText(ctx, 'CLEAR EVERY PELLET TO ARM THE GOLD POWER NODES', VIEW_W / 2, cy + 40, { size: 10 });
+        drawText(ctx, 'STEP ON AN ARMED NODE FOR A LIGHTNING STRIKE', VIEW_W / 2, cy + 58, { size: 10 });
+        break;
+      }
+      case 'victory': {
+        ctx.fillStyle = 'rgba(0,0,0,.6)'; ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+        const cy = VIEW_H / 2;
+        drawText(ctx, 'VICTORY!', VIEW_W / 2, cy - 70, { size: 40, color: '#ffe600', glow: 18 });
+        drawText(ctx, 'THE CORE IS PURGED', VIEW_W / 2, cy - 30, { size: 14, color: '#2af6ff', glow: 8 });
+        drawText(ctx, 'FINAL SCORE', VIEW_W / 2, cy + 6, { size: 10, color: '#7f9bb5' });
+        drawText(ctx, String(g.score), VIEW_W / 2, cy + 26, { size: 22 });
+        if (g.newHi && Math.floor(t * 3) % 2 === 0) drawText(ctx, 'NEW HIGH SCORE!', VIEW_W / 2, cy + 54, { size: 12, color: '#ff2bd6', glow: 8 });
+        if (g.stateTimer <= 0) drawText(ctx, 'PRESS ENTER OR TAP', VIEW_W / 2, cy + 90, { size: 11 });
+        break;
+      }
+    }
+    if (g.bannerMsg) {
+      const y = HUD_TOP + 22;
+      ctx.fillStyle = 'rgba(0,0,0,.78)'; ctx.fillRect(0, y - 12, VIEW_W, 24);
+      drawText(ctx, g.bannerMsg.text, VIEW_W / 2, y, { size: 12, color: '#ffd400', glow: 8 });
+    }
+    if (g.paused) {
+      ctx.fillStyle = 'rgba(0,0,0,.65)'; ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+      drawText(ctx, 'PAUSED', VIEW_W / 2, VIEW_H / 2 - 10, { size: 26, color: '#2af6ff', glow: 12 });
+      drawText(ctx, 'SPACE / P TO RESUME', VIEW_W / 2, VIEW_H / 2 + 20, { size: 11 });
+    }
+  }
+  drawTitle(ctx, t) {
+    const g = this.game, mid = VIEW_W / 2;
+    // receding neon floor grid
+    ctx.strokeStyle = 'rgba(47,107,255,.22)'; ctx.lineWidth = 1;
+    for (let i = 0; i < 12; i++) {
+      const y = 400 + Math.pow((i + (t * 0.6) % 1) / 12, 2) * 184;
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(VIEW_W, y); ctx.stroke();
+    }
+    for (let i = -8; i <= 8; i++) { ctx.beginPath(); ctx.moveTo(mid + i * 14, 400); ctx.lineTo(mid + i * 70, VIEW_H); ctx.stroke(); }
+    drawText(ctx, 'HI-SCORE', mid, 22, { size: 9, color: '#7f9bb5' });
+    drawText(ctx, String(g.hi), mid, 36, { size: 14, color: '#ffe600' });
+    drawText(ctx, 'CHOMP', mid, 92, { size: 52, color: '#ffe600', glow: 18 });
+    drawText(ctx, 'ODYSSEY', mid, 142, { size: 40, color: '#ff2bd6', glow: 18 });
+    drawText(ctx, 'FOUR MAZES · FOUR GHOSTS · ONE KING', mid, 178, { size: 10, color: '#2af6ff' });
+    GHOSTS.forEach((gh, i) => {
+      const y = 214 + i * 30;
+      drawGhost(ctx, (118 - 8) / TS, (y - 8) / TS, gh.color, RIGHT, 'normal', t);
+      drawText(ctx, gh.name, 140, y, { size: 13, color: gh.color, align: 'left', glow: 6 });
+      drawText(ctx, gh.role, 230, y, { size: 11, color: '#c8d8e8', align: 'left' });
+    });
+    drawText(ctx, 'AND THE GLITCH KING WAITS IN THE CORE...', mid, 346, { size: 10, color: '#ff3b30', glow: 6 });
+    if (Math.floor(t * 2) % 2 === 0) drawText(ctx, 'PRESS ENTER OR TAP TO START', mid, 384, { size: 13, color: '#fff', glow: 6 });
+    drawText(ctx, 'ARROWS / WASD / SWIPE TO MOVE', mid, 420, { size: 10, color: '#9fb4c8' });
+    drawText(ctx, 'SPACE PAUSE · M MUTE · C CRT', mid, 436, { size: 10, color: '#9fb4c8' });
+    // attract-mode chase: the hero eats a row of frightened ghosts, forever
+    const span = VIEW_W + 220, x = ((t * 90) % span) - 110, y = 506;
+    drawPac(ctx, x, y, 9, 0, 0.05 + Math.abs(Math.sin(t * 12)) * 0.75);
+    for (let i = 0; i < 4; i++) {
+      const gx = x + 34 + i * 26;
+      if (gx < VIEW_W + 20) drawGhost(ctx, (gx - 8) / TS, (y - 8) / TS, '#fff', LEFT, Math.floor(t * 4) % 2 ? 'fright' : 'flash', t);
+    }
+    drawText(ctx, 'NO IMAGE OR AUDIO FILES · EVERYTHING IS PROCEDURAL', mid, 562, { size: 9, color: '#4a6278' });
+  }
+}
+
+/* ============================================================== GameEngine
+   States: title -> ready -> play -> (dying -> ready | gameover)
+                                  -> clear -> next stage -> ... -> bossintro -> ready -> play -> victory */
+class GameEngine {
+  constructor() {
+    this.state = 'title'; this.paused = false; this.time = 0; this.stateTimer = 0;
+    this.hi = parseInt(store.get('hi', '0'), 10) || 0; this.newHi = false;
+    this.levelIndex = 0; this.level = LEVELS[0]; this.score = 0; this.lives = 3; this.nextLife = EXTRA_LIFE_SCORE;
+    this.shake = 0; this.bannerMsg = null; this.hazard = null; this.fruit = null;
+    this.freeze = 0; this.freezeGhost = null; this.frightTimer = 0; this.deathT = 0; this.elroy = 0; this.combo = 0;
+    this.ghostMode = 'scatter'; this.modeIndex = 0; this.modeTimer = 0; this.roundTime = 0;
+    const canvas = $('#game');
+    this.audio = new AudioManager();
+    this.map = new MapManager();
+    this.fx = new FX();
+    this.input = new InputManager(this, canvas);
+    this.ents = new EntityManager(this);
+    this.ui = new UIManager(this, canvas);
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) return;
+      this.saveHi();
+      if (this.inGame && !this.paused) this.togglePause();
+    });
+  }
+  get player() { return this.ents.player; }
+  get ghosts() { return this.ents.ghosts; }
+  get minions() { return this.ents.minions; }
+  get boss() { return this.ents.boss; }
+  get balls() { return this.ents.balls; }
+  get inGame() { return ['ready', 'play', 'dying', 'clear', 'bossintro'].includes(this.state); }
+
+  start() {
+    let last = performance.now(), acc = 0;
+    const loop = now => {
+      acc += Math.min(0.25, (now - last) / 1000); last = now;
+      let n = 0;
+      while (acc >= STEP && n < 10) { this.update(STEP); acc -= STEP; n++; }
+      if (n === 10) acc = 0; // fell far behind (tab was hidden): drop the backlog
+      this.ui.render();
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+
+  action(kind) {
+    this.audio.init(); // every input is a user gesture, so this is where audio gets unlocked
+    if (kind === 'mute') { this.audio.toggleMute(); this.ui.syncButtons(); return; }
+    if (kind === 'crt') { this.ui.toggleCrt(); return; }
+    if (this.state === 'title') { if (kind !== 'pause') this.newGame(); return; }
+    if (this.state === 'gameover' || this.state === 'victory') {
+      if (kind !== 'pause' && this.stateTimer <= 0) { this.state = 'title'; this.fx.clear(); }
+      return;
+    }
+    if (kind === 'pause' || kind === 'primary') this.togglePause();
+  }
+  togglePause() {
+    if (!this.inGame) return;
+    this.paused = !this.paused;
+    if (this.paused) this.audio.setLoop(null);
+    this.ui.syncButtons();
+  }
+
+  newGame() {
+    this.score = 0; this.lives = 3; this.nextLife = EXTRA_LIFE_SCORE; this.newHi = false; this.hiAtStart = this.hi;
+    this.levelIndex = 0; this.paused = false; this.fx.clear();
+    this.loadLevel(0);
+  }
+  loadLevel(i) {
+    this.levelIndex = i; this.level = LEVELS[i];
+    this.map.load(this.level);
+    this.ents.setup(this.level);
+    this.ui.buildMaze();
+    this.fruit = null; this.elroy = 0; this.hazard = null; this.bannerMsg = null;
+    this.startRound(true);
+  }
+  startRound(fresh) {
+    this.ents.resetRound();
+    this.input.dir = NONE;
+    this.ghostMode = 'scatter'; this.modeIndex = 0; this.modeTimer = MODE_SCHEDULE[0];
+    this.frightTimer = 0; this.roundTime = 0; this.freeze = 0; this.freezeGhost = null; this.combo = 0;
+    if (this.hazard) this.hazard = { phase: 'off', t: 3 };
+    this.audio.setLoop(null);
+    if (fresh && this.level.boss) { this.state = 'bossintro'; this.stateTimer = 3.4; this.audio.bossRoar(); }
+    else { this.state = 'ready'; this.stateTimer = fresh ? 2.4 : 1.6; if (fresh) this.audio.fanfare(); }
+  }
+  banner(text, t) { this.bannerMsg = { text, t }; }
+  addScore(n) {
+    this.score += n;
+    if (this.score >= this.nextLife) {
+      this.lives++; this.nextLife += EXTRA_LIFE_SCORE;
+      this.audio.extraLife(); this.banner('EXTRA LIFE!', 1.6);
+    }
+    if (this.score > this.hi) this.hi = this.score;
+  }
+  saveHi() { store.set('hi', this.hi); }
+
+  update(dt) {
+    this.time += dt;
+    if (this.paused) return;
+    if (this.bannerMsg && (this.bannerMsg.t -= dt) <= 0) this.bannerMsg = null;
+    this.shake = this.shake > 0.2 ? this.shake * Math.exp(-dt * 7) : 0;
+    switch (this.state) {
+      case 'bossintro':
+        if ((this.stateTimer -= dt) <= 0) { this.state = 'ready'; this.stateTimer = 2; this.audio.fanfare(); }
+        break;
+      case 'ready':
+        if ((this.stateTimer -= dt) <= 0) this.state = 'play';
+        break;
+      case 'play': this.updatePlay(dt); break;
+      case 'dying': this.updateDying(dt); break;
+      case 'clear':
+        if ((this.stateTimer -= dt) <= 0) {
+          if (this.levelIndex + 1 < LEVELS.length) this.loadLevel(this.levelIndex + 1); else this.victory();
+        }
+        break;
+      case 'gameover': this.stateTimer -= dt; break;
+      case 'victory':
+        this.stateTimer -= dt;
+        if (Math.random() < dt * 5) this.fx.burst(rand(3, 25), rand(3, 26), pick(['#ffe600', '#ff2bd6', '#2af6ff', '#39ff9c']), 30, 6);
+        break;
+    }
+    this.fx.update(dt);
+  }
+  updatePlay(dt) {
+    if (this.freeze > 0) { // brief hit-stop after eating a ghost
+      if ((this.freeze -= dt) <= 0) this.freezeGhost = null;
+      return;
+    }
+    this.roundTime += dt;
+    if (!this.level.boss) {
+      if (this.frightTimer > 0) { if ((this.frightTimer -= dt) <= 0) this.endFright(); }
+      else if ((this.modeTimer -= dt) <= 0) { // scatter/chase cycle (paused while frightened)
+        this.modeIndex++;
+        this.ghostMode = this.modeIndex % 2 ? 'chase' : 'scatter';
+        this.modeTimer = MODE_SCHEDULE[Math.min(this.modeIndex, MODE_SCHEDULE.length - 1)];
+        this.ghosts.forEach(gh => { if (gh.state === 'active' && !gh.fright) gh.reverse(this.map); });
+      }
+    }
+    this.player.update(dt);
+    if (this.state !== 'play') return; // stage cleared mid-move
+    this.ents.update(dt);
+    if (this.state !== 'play') return; // boss defeated
+    if (this.fruit && (this.fruit.t -= dt) <= 0) this.fruit = null;
+    for (const s of this.map.megas) if (s.timer > 0 && (s.timer -= dt) <= 0) this.map.dots[this.map.idx(s.x, s.y)] = 3;
+    this.updateHazard(dt);
+    this.checkCollisions();
+    if (this.state !== 'play') return;
+    const charged = this.frightTimer > 0 || this.player.power > 0;
+    this.audio.setLoop(charged ? 'fright' : this.level.boss ? 'boss' : 'siren',
+      this.level.boss ? (this.boss.phase - 1) / 2 : 1 - this.map.left / this.map.total);
+  }
+  updateHazard(dt) {
+    const H = this.hazard;
+    if (!H || (H.t -= dt) > 0) return;
+    if (H.phase === 'off') { H.phase = 'warn'; H.t = 1.2; }
+    else if (H.phase === 'warn') { H.phase = 'on'; H.t = 1.6; this.audio.zap(); }
+    else { H.phase = 'off'; H.t = this.boss.phase === 3 ? 2.4 : 3.2; }
+  }
+  updateDying(dt) {
+    const before = this.deathT;
+    this.deathT += dt;
+    if (before < 0.6 && this.deathT >= 0.6) { this.audio.death(); this.fx.burst(this.player.x, this.player.y, '#ffe600', 30, 5); }
+    if ((this.stateTimer -= dt) > 0) return;
+    this.lives--;
+    if (this.lives <= 0) this.gameOver(); else this.startRound(false);
+  }
+
+  eatAt(x, y) {
+    const map = this.map, i = map.idx(x, y), d = map.dots[i];
+    if (!d) return;
+    map.dots[i] = 0;
+    if (d === 3) { // mega-energizer (boss stage)
+      this.player.power = 8;
+      this.addScore(100); this.audio.powerPellet();
+      this.minions.forEach(m => m.reverse(map));
+      const s = map.megas.find(m => m.x === x && m.y === y);
+      if (s) s.timer = 10;
+      this.fx.popup(x, y - 0.8, 'MEGA!', '#ffe600'); this.fx.burst(x, y, '#ffe600', 18, 4);
+      return;
+    }
+    map.left--; map.eaten++;
+    if (d === 1) { this.addScore(10); this.audio.chomp(); }
+    else { this.addScore(50); this.audio.powerPellet(); this.startFright(); }
+    if (!this.level.boss) {
+      if (map.eaten === 70 || map.eaten === 170) { const f = this.level.fruit; this.fruit = { ...f, t: 9.5 }; }
+      this.elroy = map.left <= 10 ? 2 : map.left <= 20 ? 1 : 0;
+      if (map.left === 0) this.stageClear();
+    } else if (map.left === 0 && !map.armed) {
+      map.armed = true;
+      this.banner('CIRCUIT COMPLETE · NODES ARMED', 2.4); this.audio.extraLife();
+    }
+  }
+  onNode() {
+    const B = this.boss;
+    if (!B || !this.map.armed || B.state === 'dying') return;
+    const P = this.player;
+    this.map.armed = false;
+    this.fx.bolt(P.tx, P.ty, B.x, B.y); this.fx.ring(P.tx, P.ty, '#ffd400', 2.5);
+    this.audio.nodeBlast();
+    this.banner('NODE DETONATED!', 1.6);
+    this.map.refillPellets();
+    B.damage(2);
+  }
+  startFright() {
+    const T = this.level.frightTime;
+    if (!T) return;
+    this.frightTimer = T; this.combo = 0;
+    for (const gh of this.ghosts) {
+      if (gh.state === 'eaten' || gh.state === 'entering') continue;
+      if (gh.state === 'active') gh.reverse(this.map);
+      gh.fright = true;
+    }
+  }
+  endFright() { this.frightTimer = 0; this.ghosts.forEach(gh => { gh.fright = false; }); }
+
+  checkCollisions() {
+    const P = this.player, map = this.map;
+    const near = (a, r) => { let dx = Math.abs(P.x - a.x); dx = Math.min(dx, COLS - dx); return dx * dx + (P.y - a.y) ** 2 < r * r; };
+    for (const gh of this.ghosts) {
+      if (gh.state !== 'active' || !near(gh, 0.62)) continue;
+      if (gh.fright) this.eatGhost(gh); else return this.killPlayer();
+    }
+    for (const m of this.minions) {
+      if (m.spawnT < 0.6 || !near(m, 0.62)) continue;
+      if (!m.fright) return this.killPlayer();
+      m.dead = true; this.addScore(300);
+      this.fx.popup(m.x, m.y, '300'); this.fx.burst(m.x, m.y, '#7dff5a', 18, 5); this.audio.ghostEaten();
+    }
+    const B = this.boss;
+    if (B && B.state !== 'dying' && near(B, B.r + 0.35)) {
+      if (P.power > 0 && B.invuln <= 0) { // ram!
+        P.power = 0;
+        const dx = B.x - P.x, dy = B.y - P.y, d = Math.hypot(dx, dy) || 1;
+        B.vx = dx / d * 9; B.vy = dy / d * 9; B.stun = 1.1; B.state = 'roam';
+        B.damage(1);
+      } else if (P.power <= 0 && B.stun <= 0) return this.killPlayer();
+    }
+    for (const b of this.balls) {
+      if (!near(b, 0.5)) continue;
+      if (P.power > 0) { b.life = 0; this.fx.burst(b.x, b.y, '#ffe600', 8, 3); } else return this.killPlayer();
+    }
+    if (this.hazard && this.hazard.phase === 'on' && map.tile(Math.round(P.x), Math.round(P.y)) === 'x') {
+      this.fx.burst(P.x, P.y, '#e8f6ff', 20, 5);
+      return this.killPlayer();
+    }
+    if (this.fruit && near(this.fruit, 0.75)) {
+      this.addScore(this.fruit.points); this.audio.fruit();
+      this.fx.popup(this.fruit.x, this.fruit.y, String(this.fruit.points), '#ff9ae6');
+      this.fruit = null;
+    }
+  }
+  eatGhost(gh) {
+    const pts = 200 * 2 ** this.combo;
+    this.combo = Math.min(this.combo + 1, 3);
+    this.addScore(pts);
+    gh.state = 'eaten'; gh.fright = false;
+    this.fx.popup(gh.x, gh.y, String(pts)); this.fx.burst(gh.x, gh.y, gh.color, 22, 5);
+    this.audio.ghostEaten();
+    this.freeze = 0.55; this.freezeGhost = gh;
+  }
+  killPlayer() {
+    this.state = 'dying'; this.stateTimer = 2.4; this.deathT = 0;
+    this.audio.setLoop(null);
+  }
+  stageClear() {
+    this.state = 'clear'; this.stateTimer = 2.6; this.fruit = null;
+    this.audio.setLoop(null); this.audio.extraLife();
+  }
+  finish(state) {
+    this.state = state; this.stateTimer = 1.5; this.audio.setLoop(null);
+    this.newHi = this.score > this.hiAtStart;
+    this.saveHi();
+  }
+  gameOver() { this.finish('gameover'); }
+  victory() { this.finish('victory'); this.audio.fanfare(); this.audio.extraLife(); }
+}
+
+const game = new GameEngine();
+window.game = game; // handy for poking at it from the devtools console
+game.start();
+</script>
+</body>
+</html>
